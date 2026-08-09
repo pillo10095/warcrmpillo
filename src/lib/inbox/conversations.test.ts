@@ -2,8 +2,79 @@ import { describe, it, expect } from "vitest";
 import {
   matchesContactFilters,
   normalizeConversation,
+  prismaToConversation,
 } from "./conversations";
 import type { Conversation } from "@/types";
+
+const ISO = "2025-01-01T00:00:00.000Z";
+
+type ConversationRow = Parameters<typeof prismaToConversation>[0];
+
+interface ContactFixture {
+  id: string;
+  accountId: string;
+  userId: string;
+  phone: string;
+  phoneNormalized: string | null;
+  name: string | null;
+  email: string | null;
+  company: string | null;
+  avatarUrl: string | null;
+  createdAt: Date;
+  updatedAt: Date;
+  contactTags: {
+    id: string;
+    contactId: string;
+    tagId: string;
+    createdAt: Date;
+    tag: {
+      id: string;
+      accountId: string;
+      userId: string;
+      name: string;
+      color: string;
+      createdAt: Date;
+    };
+  }[];
+}
+
+/** Full Prisma `Conversation` row shape (CONVERSATION_INCLUDE payload).
+ *  Cast because the Prisma payload types a required-relation include as
+ *  non-nullable, while the mapper itself handles `contact: null`. */
+function makePrismaRow(contact: ContactFixture | null): ConversationRow {
+  return {
+    id: "c1",
+    accountId: "a1",
+    userId: "u1",
+    contactId: "ct1",
+    status: "open",
+    assignedAgentId: null,
+    lastMessageText: null,
+    lastMessageAt: null,
+    unreadCount: 0,
+    createdAt: new Date(ISO),
+    updatedAt: new Date(ISO),
+    contact,
+  } as unknown as ConversationRow;
+}
+
+function makeContact(overrides: Partial<ContactFixture> = {}): ContactFixture {
+  return {
+    id: "ct1",
+    accountId: "a1",
+    userId: "u1",
+    phone: "+15551234567",
+    phoneNormalized: null,
+    name: "Ada",
+    email: null,
+    company: "Acme",
+    avatarUrl: null,
+    createdAt: new Date(ISO),
+    updatedAt: new Date(ISO),
+    contactTags: [],
+    ...overrides,
+  };
+}
 
 function makeConversation(
   contact: Partial<Conversation["contact"]> | null,
@@ -141,5 +212,128 @@ describe("normalizeConversation", () => {
     };
     // A contactless row passes through untouched (consumers use `?.`).
     expect(normalizeConversation(raw).contact).toBeNull();
+  });
+});
+
+describe("prismaToConversation", () => {
+  it("maps camelCase columns to the snake_case wire shape", () => {
+    const row = makePrismaRow(
+      makeContact({
+        contactTags: [
+          {
+            id: "j1",
+            contactId: "ct1",
+            tagId: "t1",
+            createdAt: new Date(ISO),
+            tag: {
+              id: "t1",
+              accountId: "a1",
+              userId: "u1",
+              name: "VIP",
+              color: "#fbbf24",
+              createdAt: new Date(ISO),
+            },
+          },
+        ],
+      }),
+    );
+    row.assignedAgentId = "agent-1";
+    row.lastMessageText = "Hello";
+    row.lastMessageAt = new Date("2025-01-02T00:00:00.000Z");
+    row.unreadCount = 3;
+
+    const mapped = prismaToConversation(row);
+
+    expect(mapped.id).toBe("c1");
+    expect(mapped.user_id).toBe("u1");
+    expect(mapped.contact_id).toBe("ct1");
+    expect(mapped.status).toBe("open");
+    expect(mapped.assigned_agent_id).toBe("agent-1");
+    expect(mapped.last_message_text).toBe("Hello");
+    expect(mapped.last_message_at).toBe("2025-01-02T00:00:00.000Z");
+    expect(mapped.unread_count).toBe(3);
+    expect(mapped.created_at).toBe(ISO);
+    expect(mapped.updated_at).toBe(ISO);
+  });
+
+  it("flattens contactTags[].tag into contact.tags", () => {
+    const row = makePrismaRow(
+      makeContact({
+        contactTags: [
+          {
+            id: "j1",
+            contactId: "ct1",
+            tagId: "t1",
+            createdAt: new Date(ISO),
+            tag: {
+              id: "t1",
+              accountId: "a1",
+              userId: "u1",
+              name: "VIP",
+              color: "#fbbf24",
+              createdAt: new Date(ISO),
+            },
+          },
+          {
+            id: "j2",
+            contactId: "ct1",
+            tagId: "t2",
+            createdAt: new Date(ISO),
+            tag: {
+              id: "t2",
+              accountId: "a1",
+              userId: "u1",
+              name: "Lead",
+              color: "#3b82f6",
+              createdAt: new Date(ISO),
+            },
+          },
+        ],
+      }),
+    );
+
+    const mapped = prismaToConversation(row);
+
+    expect(mapped.contact?.tags).toEqual([
+      {
+        id: "t1",
+        user_id: "u1",
+        name: "VIP",
+        color: "#fbbf24",
+        created_at: ISO,
+      },
+      {
+        id: "t2",
+        user_id: "u1",
+        name: "Lead",
+        color: "#3b82f6",
+        created_at: ISO,
+      },
+    ]);
+  });
+
+  it("maps the embedded contact and drops the join wrapper", () => {
+    const mapped = prismaToConversation(makePrismaRow(makeContact()));
+
+    expect(mapped.contact).toEqual({
+      id: "ct1",
+      user_id: "u1",
+      account_id: "a1",
+      phone: "+15551234567",
+      phone_normalized: undefined,
+      name: "Ada",
+      email: undefined,
+      company: "Acme",
+      avatar_url: undefined,
+      created_at: ISO,
+      updated_at: ISO,
+      tags: [],
+    });
+  });
+
+  it("handles a null contact", () => {
+    const mapped = prismaToConversation(makePrismaRow(null));
+
+    expect(mapped.contact).toBeUndefined();
   });
 });

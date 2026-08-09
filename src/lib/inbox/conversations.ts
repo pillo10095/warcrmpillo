@@ -1,3 +1,4 @@
+import type { Prisma } from '@prisma/client';
 import type { Conversation, Contact, Tag } from "@/types";
 
 /**
@@ -40,6 +41,62 @@ export function normalizeConversations(
   rows: RawConversation[],
 ): Conversation[] {
   return rows.map(normalizeConversation);
+}
+
+/** Prisma include that embeds the contact + its tags — the MySQL
+ *  replacement for the Supabase {@link CONVERSATION_SELECT} string. */
+export const CONVERSATION_INCLUDE = {
+  contact: { include: { contactTags: { include: { tag: true } } } },
+} satisfies Prisma.ConversationInclude;
+
+type ConversationRow = Prisma.ConversationGetPayload<{
+  include: typeof CONVERSATION_INCLUDE;
+}>;
+
+/** Map a Prisma conversation row (camelCase, nested contactTags) into
+ *  the snake_case wire `Conversation` shape — same output the Supabase
+ *  {@link normalizeConversation} produced, so v1 serializers see no
+ *  change. */
+export function prismaToConversation(row: ConversationRow): Conversation {
+  return {
+    id: row.id,
+    user_id: row.userId,
+    contact_id: row.contactId,
+    status: row.status,
+    assigned_agent_id: row.assignedAgentId ?? undefined,
+    last_message_text: row.lastMessageText ?? undefined,
+    last_message_at: row.lastMessageAt?.toISOString() ?? undefined,
+    unread_count: row.unreadCount,
+    created_at: row.createdAt.toISOString(),
+    updated_at: row.updatedAt.toISOString(),
+    contact: row.contact
+      ? {
+          id: row.contact.id,
+          user_id: row.contact.userId,
+          account_id: row.contact.accountId,
+          phone: row.contact.phone,
+          phone_normalized: row.contact.phoneNormalized ?? undefined,
+          name: row.contact.name ?? undefined,
+          email: row.contact.email ?? undefined,
+          company: row.contact.company ?? undefined,
+          avatar_url: row.contact.avatarUrl ?? undefined,
+          created_at: row.contact.createdAt.toISOString(),
+          updated_at: row.contact.updatedAt.toISOString(),
+          tags: (row.contact.contactTags ?? [])
+            .map((ct) => ct.tag)
+            .filter((t): t is Prisma.TagGetPayload<Record<string, never>> =>
+              t != null,
+            )
+            .map((t) => ({
+              id: t.id,
+              user_id: t.userId,
+              name: t.name,
+              color: t.color,
+              created_at: t.createdAt.toISOString(),
+            })),
+        }
+      : undefined,
+  };
 }
 
 export interface ContactFilters {
