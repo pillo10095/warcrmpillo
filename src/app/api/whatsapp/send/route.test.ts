@@ -9,7 +9,6 @@ import { afterEach, beforeEach, describe, expect, it, vi } from 'vitest'
 
 // Records of what the route wrote, so we can assert the right rows landed.
 const conversationInserts: Array<Record<string, unknown>> = []
-const messageInserts: Array<Record<string, unknown>> = []
 
 // Toggles for the per-test scenario.
 let existingConversation: Record<string, unknown> | null = null
@@ -79,8 +78,6 @@ function makeSupabaseMock() {
             },
             error: null,
           }
-        case 'messages':
-          return { data: { id: 'msg-1' }, error: null }
         default:
           return { data: null, error: null }
       }
@@ -105,7 +102,6 @@ function makeSupabaseMock() {
           contact: CONTACT,
         }
       }
-      if (table === 'messages') messageInserts.push(payload)
       return b
     })
     b.single = vi.fn(terminal)
@@ -151,13 +147,73 @@ vi.mock('@/lib/whatsapp/encryption', () => ({
   isLegacyFormat: vi.fn(() => false),
 }))
 
-const { sendTemplateMessage } = vi.hoisted(() => ({
+const { sendTemplateMessage, prisma } = vi.hoisted(() => ({
   sendTemplateMessage: vi.fn(async () => ({ messageId: 'wamid-1' })),
+  // The shared send core (`sendMessageToConversation`) reads the
+  // conversation + contact, config, template and persist path through
+  // the prisma singleton — the Supabase client is only used by the
+  // route's own find-or-create. `findFirst` echoes the requested
+  // conversation id so the message/conversation writes can be asserted
+  // against the right thread.
+  prisma: {
+    conversation: {
+      findFirst: vi.fn((args: { where?: { id?: string } }) =>
+        Promise.resolve({
+          id: args?.where?.id ?? 'conv-new',
+          accountId: 'acct-1',
+          userId: 'user-1',
+          contactId: 'contact-1',
+          status: 'open',
+          lastMessageText: null,
+          lastMessageAt: null,
+          unreadCount: 0,
+          createdAt: new Date('2026-01-01T00:00:00Z'),
+          updatedAt: new Date('2026-01-01T00:00:00Z'),
+          contact: {
+            id: 'contact-1',
+            userId: 'user-1',
+            accountId: 'acct-1',
+            phone: '+15551234567',
+          },
+        })
+      ),
+      update: vi.fn(async () => ({})),
+    },
+    whatsAppConfig: {
+      findUnique: vi.fn(async () => ({
+        id: 'cfg-1',
+        accountId: 'acct-1',
+        userId: 'user-1',
+        phoneNumberId: 'PNID-1',
+        accessToken: 'enc-token',
+      })),
+      update: vi.fn(async () => ({})),
+    },
+    message: {
+      create: vi.fn(async () => ({ id: 'msg-1' })),
+    },
+    messageTemplate: { findFirst: vi.fn(async () => null) },
+    contact: { update: vi.fn(async () => ({})) },
+  },
 }))
+vi.mock('@/lib/db/prisma', () => ({ prisma }))
 vi.mock('@/lib/whatsapp/meta-api', () => ({
   sendTemplateMessage,
   sendTextMessage: vi.fn(),
   sendMediaMessage: vi.fn(),
+  sendInteractiveButtons: vi.fn(),
+  sendInteractiveList: vi.fn(),
+  INTERACTIVE_LIMITS: {
+    maxButtons: 3,
+    buttonTitleMaxLength: 20,
+    maxListSections: 10,
+    maxListRowsTotal: 10,
+    listRowTitleMaxLength: 24,
+    listRowDescriptionMaxLength: 72,
+    bodyMaxLength: 1024,
+    footerMaxLength: 60,
+    headerTextMaxLength: 60,
+  },
 }))
 
 import { POST } from './route'
@@ -183,7 +239,6 @@ function postContactTemplate(overrides: Record<string, unknown> = {}) {
 describe('POST /api/whatsapp/send — contact_id template path', () => {
   beforeEach(() => {
     conversationInserts.length = 0
-    messageInserts.length = 0
     existingConversation = null
     createdConversation = null
     contactRow = CONTACT
@@ -222,12 +277,23 @@ describe('POST /api/whatsapp/send — contact_id template path', () => {
     expect(args.templateName).toBe('order_update')
 
     // The outbound message was persisted under the new conversation.
-    expect(messageInserts).toHaveLength(1)
-    expect(messageInserts[0]).toMatchObject({
-      conversation_id: 'conv-new',
-      content_type: 'template',
-      template_name: 'order_update',
-      sender_type: 'agent',
+    expect(prisma.message.create).toHaveBeenCalledWith(
+      expect.objectContaining({
+        data: expect.objectContaining({
+          conversationId: 'conv-new',
+          contentType: 'template',
+          templateName: 'order_update',
+          senderType: 'agent',
+        }),
+      })
+    )
+    // The shared core touched the conversation's last-message fields.
+    expect(prisma.conversation.update).toHaveBeenCalledWith({
+      where: { id: 'conv-new' },
+      data: expect.objectContaining({
+        lastMessageText: expect.any(String),
+        lastMessageAt: expect.any(Date),
+      }),
     })
   })
 
@@ -243,7 +309,11 @@ describe('POST /api/whatsapp/send — contact_id template path', () => {
     expect(res.status).toBe(200)
 
     expect(conversationInserts).toHaveLength(0)
-    expect(messageInserts[0]).toMatchObject({ conversation_id: 'conv-existing' })
+    expect(prisma.message.create).toHaveBeenCalledWith(
+      expect.objectContaining({
+        data: expect.objectContaining({ conversationId: 'conv-existing' }),
+      })
+    )
   })
 
   it('404s when the contact is not in the caller account', async () => {
@@ -272,7 +342,6 @@ describe('POST /api/whatsapp/send — contact_id template path', () => {
 describe('POST /api/whatsapp/send — role enforcement', () => {
   beforeEach(() => {
     conversationInserts.length = 0
-    messageInserts.length = 0
     existingConversation = {
       id: 'conv-existing',
       account_id: 'acct-1',
@@ -302,7 +371,7 @@ describe('POST /api/whatsapp/send — role enforcement', () => {
 
     expect(res.status).toBe(403)
     expect(sendTemplateMessage).not.toHaveBeenCalled()
-    expect(messageInserts).toHaveLength(0)
+    expect(prisma.message.create).not.toHaveBeenCalled()
   })
 
   it('allows an agent through', async () => {

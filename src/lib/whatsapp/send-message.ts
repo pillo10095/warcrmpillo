@@ -10,16 +10,18 @@
 //   4. persists the message + updates the conversation,
 //   5. pauses any active Flow run for the contact (agent stepped in).
 //
-// It is transport-agnostic: it takes a `SupabaseClient` and an
-// `accountId` and throws `SendMessageError` on failure. The callers
-// own auth, rate-limiting, body parsing, and mapping the error to
-// their respective response shapes (internal `{ error }` vs the v1
+// It is transport-agnostic: it takes a legacy `_db` argument (kept so
+// not-yet-migrated callers keep compiling — it is ignored) and an
+// `accountId` and throws `SendMessageError` on failure. Queries hit the
+// `prisma` singleton, scoped by `accountId`. The callers own auth,
+// rate-limiting, body parsing, and mapping the error to their
+// respective response shapes (internal `{ error }` vs the v1
 // envelope). Behaviour is identical to the original inline route —
 // this is a straight extraction so the public endpoint can reuse it
 // without duplicating ~250 lines of Meta plumbing.
 // ============================================================
 
-import type { SupabaseClient } from '@supabase/supabase-js';
+import { Prisma, type ContentType } from '@prisma/client';
 
 import {
   sendTextMessage,
@@ -42,8 +44,10 @@ import {
   phoneVariants,
   isRecipientNotAllowedError,
 } from '@/lib/whatsapp/phone-utils';
+import { prisma } from '@/lib/db/prisma';
 import type { MessageTemplate } from '@/types';
 import { isMessageTemplate } from '@/lib/whatsapp/template-row-guard';
+import { prismaTemplateToMessage } from '@/lib/whatsapp/template-row-mapper';
 
 export const MEDIA_KINDS = ['image', 'video', 'document', 'audio'] as const;
 export const VALID_MESSAGE_TYPES = [
@@ -96,9 +100,9 @@ export interface SendMessageResult {
 /**
  * Send a message in an existing conversation and persist it.
  *
- * `db` may be an RLS-scoped user client (dashboard) or the service-
- * role client (public API) — every query is filtered by `accountId`
- * either way, so tenancy holds regardless of which client is passed.
+ * `_db` is kept for callers that still pass a Supabase client — it is
+ * ignored. Every Prisma query is filtered by `accountId`, so tenancy
+ * holds regardless of which client was historically passed.
  */
 /**
  * Validate the message-shape params (type, required content, caption
@@ -181,7 +185,7 @@ export function validateSendMessageParams(params: {
 }
 
 export async function sendMessageToConversation(
-  db: SupabaseClient,
+  _db: unknown,
   accountId: string,
   params: SendMessageParams
 ): Promise<SendMessageResult> {
@@ -218,14 +222,12 @@ export async function sendMessageToConversation(
   const isMediaKind = (MEDIA_KINDS as readonly string[]).includes(messageType);
 
   // Conversation + contact, account-scoped.
-  const { data: conversation, error: convError } = await db
-    .from('conversations')
-    .select('*, contact:contacts(*)')
-    .eq('id', conversationId)
-    .eq('account_id', accountId)
-    .single();
+  const conversation = await prisma.conversation.findFirst({
+    where: { id: conversationId, accountId },
+    include: { contact: true },
+  });
 
-  if (convError || !conversation) {
+  if (!conversation) {
     throw new SendMessageError('not_found', 'Conversation not found', 404);
   }
 
@@ -248,13 +250,11 @@ export async function sendMessageToConversation(
   }
 
   // WhatsApp config, account-scoped.
-  const { data: config, error: configError } = await db
-    .from('whatsapp_config')
-    .select('*')
-    .eq('account_id', accountId)
-    .single();
+  const config = await prisma.whatsAppConfig.findUnique({
+    where: { accountId },
+  });
 
-  if (configError || !config) {
+  if (!config) {
     throw new SendMessageError(
       'whatsapp_not_configured',
       'WhatsApp not configured. Please set up your WhatsApp integration first.',
@@ -262,21 +262,17 @@ export async function sendMessageToConversation(
     );
   }
 
-  const accessToken = decrypt(config.access_token);
+  const accessToken = decrypt(config.accessToken);
 
   // Self-heal legacy CBC ciphertexts. Fire-and-forget; idempotent.
-  if (isLegacyFormat(config.access_token)) {
-    void db
-      .from('whatsapp_config')
-      .update({ access_token: encrypt(accessToken) })
-      .eq('id', config.id)
-      .then(({ error }: { error: { message: string } | null }) => {
-        if (error) {
-          console.warn(
-            '[send-message] access_token GCM upgrade failed:',
-            error.message
-          );
-        }
+  if (isLegacyFormat(config.accessToken)) {
+    void prisma.whatsAppConfig
+      .update({
+        where: { id: config.id },
+        data: { accessToken: encrypt(accessToken) },
+      })
+      .catch((err: unknown) => {
+        console.warn('[send-message] access_token GCM upgrade failed:', err);
       });
   }
 
@@ -285,26 +281,24 @@ export async function sendMessageToConversation(
   // messages they can't see by guessing UUIDs.
   let contextMessageId: string | undefined;
   if (replyToMessageId) {
-    const { data: parent, error: parentError } = await db
-      .from('messages')
-      .select('message_id, conversation_id')
-      .eq('id', replyToMessageId)
-      .eq('conversation_id', conversationId)
-      .maybeSingle();
+    const parent = await prisma.message.findFirst({
+      where: { id: replyToMessageId, conversationId },
+      select: { messageId: true },
+    });
 
-    if (parentError || !parent) {
+    if (!parent) {
       throw new SendMessageError(
         'bad_request',
         'reply_to_message_id not found in this conversation',
         400
       );
     }
-    if (!parent.message_id) {
+    if (!parent.messageId) {
       console.warn(
         '[send-message] reply target has no Meta message_id; sending without context'
       );
     } else {
-      contextMessageId = parent.message_id;
+      contextMessageId = parent.messageId;
     }
   }
 
@@ -312,27 +306,30 @@ export async function sendMessageToConversation(
   // guards against a malformed local row crashing the send-builder.
   let templateRow: MessageTemplate | null = null;
   if (messageType === 'template' && templateName) {
-    const { data } = await db
-      .from('message_templates')
-      .select('*')
-      .eq('account_id', accountId)
-      .eq('name', templateName)
-      .eq('language', templateLanguage || 'en_US')
-      .maybeSingle();
-    if (data && !isMessageTemplate(data)) {
-      throw new SendMessageError(
-        'template_malformed',
-        'Template row is malformed locally — run "Sync from Meta" in Settings to repair it.',
-        500
-      );
+    const row = await prisma.messageTemplate.findFirst({
+      where: {
+        accountId,
+        name: templateName,
+        language: templateLanguage || 'en_US',
+      },
+    });
+    if (row) {
+      const mapped = prismaTemplateToMessage(row);
+      if (!isMessageTemplate(mapped)) {
+        throw new SendMessageError(
+          'template_malformed',
+          'Template row is malformed locally — run "Sync from Meta" in Settings to repair it.',
+          500
+        );
+      }
+      templateRow = mapped;
     }
-    templateRow = data ?? null;
   }
 
   const attempt = async (phone: string): Promise<string> => {
     if (messageType === 'template') {
       const result = await sendTemplateMessage({
-        phoneNumberId: config.phone_number_id,
+        phoneNumberId: config.phoneNumberId,
         accessToken,
         to: phone,
         templateName: templateName!,
@@ -346,7 +343,7 @@ export async function sendMessageToConversation(
     }
     if (isMediaKind) {
       const result = await sendMediaMessage({
-        phoneNumberId: config.phone_number_id,
+        phoneNumberId: config.phoneNumberId,
         accessToken,
         to: phone,
         kind: messageType as MediaKind,
@@ -361,7 +358,7 @@ export async function sendMessageToConversation(
       const p = interactivePayload!;
       if (p.kind === 'buttons') {
         const result = await sendInteractiveButtons({
-          phoneNumberId: config.phone_number_id,
+          phoneNumberId: config.phoneNumberId,
           accessToken,
           to: phone,
           bodyText: p.body,
@@ -373,7 +370,7 @@ export async function sendMessageToConversation(
         return result.messageId;
       }
       const result = await sendInteractiveList({
-        phoneNumberId: config.phone_number_id,
+        phoneNumberId: config.phoneNumberId,
         accessToken,
         to: phone,
         bodyText: p.body,
@@ -386,7 +383,7 @@ export async function sendMessageToConversation(
       return result.messageId;
     }
     const result = await sendTextMessage({
-      phoneNumberId: config.phone_number_id,
+      phoneNumberId: config.phoneNumberId,
       accessToken,
       to: phone,
       text: contentText!,
@@ -434,10 +431,10 @@ export async function sendMessageToConversation(
     console.log(
       `[send-message] Auto-corrected contact phone: ${sanitizedPhone} → ${workingPhone}`
     );
-    await db
-      .from('contacts')
-      .update({ phone: workingPhone })
-      .eq('id', contact.id);
+    await prisma.contact.update({
+      where: { id: contact.id },
+      data: { phone: workingPhone },
+    });
   }
 
   // Persist the sent message. Field names MUST match the messages
@@ -448,29 +445,33 @@ export async function sendMessageToConversation(
   const interactiveBody =
     messageType === 'interactive' ? interactivePayload!.body : null;
 
-  const { data: messageRecord, error: msgError } = await db
-    .from('messages')
-    .insert({
-      conversation_id: conversationId,
-      sender_type: 'agent',
-      content_type: messageType,
-      content_text: interactiveBody ?? contentText ?? null,
-      media_url: mediaUrl || null,
-      template_name: templateName || null,
-      interactive_payload:
-        messageType === 'interactive' ? interactivePayload : null,
-      message_id: waMessageId,
-      status: 'sent',
-      reply_to_message_id: replyToMessageId || null,
-    })
-    .select()
-    .single();
-
-  if (msgError) {
+  let messageId: string;
+  try {
+    const created = await prisma.message.create({
+      data: {
+        conversationId,
+        senderType: 'agent',
+        contentType: messageType as ContentType,
+        contentText: interactiveBody ?? contentText ?? null,
+        mediaUrl: mediaUrl || null,
+        templateName: templateName || null,
+        interactivePayload:
+          messageType === 'interactive'
+            ? (interactivePayload as unknown as Prisma.InputJsonValue)
+            : Prisma.DbNull,
+        messageId: waMessageId,
+        status: 'sent',
+        replyToMessageId: replyToMessageId || null,
+      },
+    });
+    messageId = created.id;
+  } catch (msgError) {
     console.error('[send-message] error inserting sent message:', msgError);
     throw new SendMessageError(
       'db_error',
-      `Message sent to Meta but failed to save to DB: ${msgError.message}`,
+      `Message sent to Meta but failed to save to DB: ${
+        msgError instanceof Error ? msgError.message : String(msgError)
+      }`,
       500
     );
   }
@@ -480,18 +481,18 @@ export async function sendMessageToConversation(
       ? interactivePayloadPreviewText(interactivePayload!)
       : contentText || `[${messageType}]`;
 
-  await db
-    .from('conversations')
-    .update({
-      last_message_text: lastMessageText,
-      last_message_at: new Date().toISOString(),
-      updated_at: new Date().toISOString(),
-    })
-    .eq('id', conversationId);
+  await prisma.conversation.update({
+    where: { id: conversationId },
+    data: {
+      lastMessageText,
+      lastMessageAt: new Date(),
+      updatedAt: new Date(),
+    },
+  });
 
   // Pause any active Flow run for this contact — the agent stepping in
   // is the strongest "yield, human is here" signal. Best-effort.
   await pauseActiveFlowRuns(accountId, contact.id);
 
-  return { messageId: messageRecord.id, whatsappMessageId: waMessageId };
+  return { messageId, whatsappMessageId: waMessageId };
 }
