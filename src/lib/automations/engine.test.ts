@@ -6,6 +6,8 @@ const h = vi.hoisted(() => ({
   state: {
     owned: null as { id: string } | null,
     ownedCustomField: null as { id: string } | null,
+    ownedConversation: null as { id: string } | null,
+    convQueries: [] as { filters: [string, string, unknown][] }[],
     automations: [] as Record<string, unknown>[],
     steps: [] as Record<string, unknown>[],
     fromCalls: [] as string[],
@@ -58,6 +60,10 @@ vi.mock("./admin-client", () => {
       return { data: { steps_executed: [], status: "success" }, error: null };
     }
     if (table === "automation_steps") return { data: state.steps, error: null };
+    if (table === "conversations") {
+      state.convQueries.push({ filters: ops.filters });
+      return { data: state.ownedConversation, error: null };
+    }
     return { data: null, error: null };
   }
 
@@ -112,6 +118,8 @@ const ACCOUNT = "acct-1";
 beforeEach(() => {
   h.state.owned = null;
   h.state.ownedCustomField = null;
+  h.state.ownedConversation = null;
+  h.state.convQueries = [];
   h.state.automations = [];
   h.state.steps = [];
   h.state.fromCalls = [];
@@ -304,6 +312,60 @@ describe("send_webhook — SSRF guard (GHSA-8jqh-598v-rfxc)", () => {
   });
 });
 
+describe("resolveConversationId — caller-supplied conversation ownership (send steps)", () => {
+  it("fails the send step when context.conversation_id is not in the account", async () => {
+    h.state.owned = { id: "c1" };
+    h.state.ownedConversation = null; // conversations ownership lookup finds nothing
+    h.state.automations = [automationWithUpdateStep()];
+    h.state.steps = [sendStep()];
+
+    await runAutomationsForTrigger({
+      accountId: ACCOUNT,
+      triggerType: "new_message_received",
+      contactId: "c1",
+      context: { conversation_id: "conv-foreign" },
+    });
+
+    // The ownership lookup is scoped to the account AND the contact before
+    // the forged conversation id is allowed anywhere near a send target.
+    expect(h.state.convQueries).toHaveLength(1);
+    expect(h.state.convQueries[0].filters).toContainEqual(["eq", "id", "conv-foreign"]);
+    expect(h.state.convQueries[0].filters).toContainEqual(["eq", "account_id", ACCOUNT]);
+    expect(h.state.convQueries[0].filters).toContainEqual(["eq", "contact_id", "c1"]);
+    // ...and the step failed with the account-scoped ownership error.
+    expect(h.state.logUpdates).toContainEqual(
+      expect.objectContaining({
+        status: "failed",
+        error_message: "conversation not in account",
+      }),
+    );
+  });
+
+  it("sends when context.conversation_id belongs to the account and matches the contact", async () => {
+    h.state.owned = { id: "c1" };
+    h.state.ownedConversation = { id: "conv-own" }; // ownership lookup succeeds
+    h.state.automations = [automationWithUpdateStep()];
+    h.state.steps = [sendStep()];
+
+    await runAutomationsForTrigger({
+      accountId: ACCOUNT,
+      triggerType: "new_message_received",
+      contactId: "c1",
+      context: { conversation_id: "conv-own" },
+    });
+
+    // Ownership passed, so the send step ran and the log promoted to success.
+    const withStatus = h.state.logUpdates.filter((u) => "status" in u);
+    expect(withStatus.at(-1)).toMatchObject({ status: "success" });
+    expect(
+      h.state.logUpdates.some((u) => {
+        const msg = (u as { error_message?: unknown }).error_message;
+        return typeof msg === "string" && msg.includes("conversation not in account");
+      }),
+    ).toBe(false);
+  });
+});
+
 function webhookStep(url: string) {
   return {
     id: "s1",
@@ -345,6 +407,17 @@ function customStep(field: string, value: string) {
     position: 0,
     parent_step_id: null,
     step_config: { field, value },
+  };
+}
+
+function sendStep() {
+  return {
+    id: "s1",
+    automation_id: "a1",
+    step_type: "send_message",
+    position: 0,
+    parent_step_id: null,
+    step_config: { text: "Hello" },
   };
 }
 

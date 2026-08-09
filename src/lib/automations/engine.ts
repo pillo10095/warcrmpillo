@@ -637,7 +637,31 @@ async function runStep(step: AutomationStep, args: ExecuteArgs): Promise<string>
  */
 async function resolveConversationId(args: ExecuteArgs): Promise<string> {
   const fromCtx = args.context.conversation_id
-  if (fromCtx) return fromCtx
+  if (fromCtx) {
+    // Caller-supplied (manual POST /api/automations/engine reads it straight
+    // from the request body). The service-role client bypasses RLS, so before
+    // any send step can touch it, verify the conversation actually belongs to
+    // this account AND to the contact being sent to — a forged foreign
+    // conversation UUID (or one belonging to a different contact in the same
+    // account) must never resolve to a send target. Same defense-in-depth as
+    // the contact-ownership guard at the entry point, just scoped to the
+    // conversations table.
+    if (!args.contactId) throw new Error('cannot resolve conversation: no contact')
+    const { data: owned, error: ownErr } = await supabaseAdmin()
+      .from('conversations')
+      .select('id')
+      .eq('id', fromCtx)
+      .eq('account_id', args.automation.account_id)
+      .eq('contact_id', args.contactId)
+      .maybeSingle()
+    if (ownErr) {
+      throw new Error(`conversation ownership check failed: ${ownErr.message}`)
+    }
+    if (!owned) {
+      throw new Error('conversation not in account')
+    }
+    return fromCtx
+  }
   if (!args.contactId) throw new Error('cannot resolve conversation: no contact')
   const { data, error } = await supabaseAdmin()
     .from('conversations')

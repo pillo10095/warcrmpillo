@@ -1,5 +1,6 @@
 import { NextResponse } from 'next/server'
 import { requireRole, toErrorResponse } from '@/lib/auth/account'
+import { checkRateLimit, rateLimitResponse, RATE_LIMITS } from '@/lib/rate-limit'
 import { runAutomationsForTrigger } from '@/lib/automations/engine'
 import type { AutomationTriggerType } from '@/types'
 
@@ -15,6 +16,14 @@ export async function POST(request: Request) {
   try {
     const ctx = await requireRole('agent')
     accountId = ctx.accountId
+
+    // Each POST fires real Meta sends, so cap the rate the same way the
+    // manual-send route does — a scripted loop could otherwise burn the
+    // account's WhatsApp throughput (and Meta's rate limits).
+    const limit = checkRateLimit(`automation-engine:${ctx.userId}`, RATE_LIMITS.send)
+    if (!limit.success) {
+      return rateLimitResponse(limit)
+    }
   } catch (err) {
     return toErrorResponse(err)
   }

@@ -1,6 +1,7 @@
 import { NextResponse } from 'next/server'
 import { createClient } from '@/lib/supabase/server'
 import { createClient as createAdminClient } from '@supabase/supabase-js'
+import { requireRole, toErrorResponse } from '@/lib/auth/account'
 import {
   registerPhoneNumber,
   subscribeWabaToApp,
@@ -165,24 +166,12 @@ export async function GET() {
  */
 export async function POST(request: Request) {
   try {
-    const supabase = await createClient()
-
-    const {
-      data: { user },
-      error: authError,
-    } = await supabase.auth.getUser()
-
-    if (authError || !user) {
-      return NextResponse.json({ error: 'Unauthorized' }, { status: 401 })
-    }
-
-    const accountId = await resolveAccountId(supabase, user.id)
-    if (!accountId) {
-      return NextResponse.json(
-        { error: 'Your profile is not linked to an account.' },
-        { status: 403 },
-      )
-    }
+    // Rotating access_token, changing phone_number_id, or cutting inbound
+    // routing is account-wide configuration — admin only. A viewer can
+    // already read this route (GET), but must not be able to mutate it.
+    // The service-role client below would otherwise let a viewer overwrite
+    // credentials the account depends on.
+    const { supabase, userId, accountId } = await requireRole('admin')
 
     const body = await request.json()
     const { phone_number_id, waba_id, access_token, verify_token, pin } = body
@@ -388,7 +377,7 @@ export async function POST(request: Request) {
         .from('whatsapp_config')
         .insert({
           account_id: accountId,
-          user_id: user.id,
+          user_id: userId,
           ...baseRow,
         })
 
@@ -426,8 +415,10 @@ export async function POST(request: Request) {
       phone_info: phoneInfo,
     })
   } catch (error) {
+    // requireRole throws Unauthorized/Forbidden; toErrorResponse maps those
+    // to 401/403 and collapses anything else to a generic 500.
     console.error('Error in WhatsApp config POST:', error)
-    return NextResponse.json({ error: 'Internal server error' }, { status: 500 })
+    return toErrorResponse(error)
   }
 }
 
@@ -440,24 +431,10 @@ export async function POST(request: Request) {
  */
 export async function DELETE() {
   try {
-    const supabase = await createClient()
-
-    const {
-      data: { user },
-      error: authError,
-    } = await supabase.auth.getUser()
-
-    if (authError || !user) {
-      return NextResponse.json({ error: 'Unauthorized' }, { status: 401 })
-    }
-
-    const accountId = await resolveAccountId(supabase, user.id)
-    if (!accountId) {
-      return NextResponse.json(
-        { error: 'Your profile is not linked to an account.' },
-        { status: 403 },
-      )
-    }
+    // Deleting the config row cuts inbound routing for the whole account —
+    // admin only, same policy as POST. A viewer must not be able to
+    // "Reset Configuration" out from under the account.
+    const { supabase, accountId } = await requireRole('admin')
 
     const { error: deleteError } = await supabase
       .from('whatsapp_config')
@@ -475,6 +452,6 @@ export async function DELETE() {
     return NextResponse.json({ success: true })
   } catch (error) {
     console.error('Error in WhatsApp config DELETE:', error)
-    return NextResponse.json({ error: 'Internal server error' }, { status: 500 })
+    return toErrorResponse(error)
   }
 }
