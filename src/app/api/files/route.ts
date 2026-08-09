@@ -1,6 +1,7 @@
 import { NextResponse } from "next/server";
 import { saveFile } from "@/lib/storage/disk";
 import { getSessionFromRequest } from "@/lib/auth/request";
+import { MEDIA_MAX_BYTES } from "@/lib/storage/upload-media";
 
 export const runtime = "nodejs";
 
@@ -21,8 +22,13 @@ const ALLOWED_MIME = new Set([
   "application/pdf",
 ]);
 
-/** Hard ceiling on a single upload (10 MB) — independent of per-kind caps. */
-const MAX_FILE_BYTES = 10 * 1024 * 1024;
+/**
+ * Hard ceiling on a single upload — shared with the client via
+ * `MEDIA_MAX_BYTES` (16 MB, mirroring Meta's WhatsApp Cloud API caps for
+ * video/audio/document). Kept in sync with `upload-media.ts` so the
+ * client-side ceiling can never accept a file the server rejects.
+ */
+const MAX_FILE_BYTES = MEDIA_MAX_BYTES;
 
 export async function POST(req: Request) {
   const session = await getSessionFromRequest(req);
@@ -43,7 +49,7 @@ export async function POST(req: Request) {
   }
   if (file.size > MAX_FILE_BYTES) {
     return NextResponse.json(
-      { error: "File exceeds the 10 MB limit" },
+      { error: "File exceeds the 16 MB limit" },
       { status: 413 },
     );
   }
