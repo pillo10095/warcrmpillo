@@ -7,8 +7,9 @@
 // has — resolves-or-creates the contact + conversation, then runs the
 // same shared send core.
 //
-// Auth: API key with the `messages:send` scope. Account context (and
-// the service-role client) come from `requireApiKey`.
+// Auth: API key with the `messages:send` scope. Account context comes
+// from `requireApiKey`; every query is explicitly scoped by
+// `ctx.accountId` (application-level RLS).
 //
 // Body:
 //   {
@@ -99,14 +100,14 @@ export async function POST(request: Request) {
     // steps share `SendMessageError`, so one catch maps the whole
     // pipeline to the envelope.
     const resolved = await resolveConversationByPhone(
-      ctx.supabase,
+      undefined,
       ctx.accountId,
       to,
       typeof body.name === 'string' ? body.name : null
     );
 
     const result = await sendMessageToConversation(
-      ctx.supabase,
+      undefined,
       ctx.accountId,
       {
         conversationId: resolved.conversationId,
