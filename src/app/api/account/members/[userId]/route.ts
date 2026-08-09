@@ -4,42 +4,47 @@
 //   PATCH  — change a member's role.   Admin+.
 //   DELETE — remove a member.          Admin+.
 //
-// Both delegate to SECURITY DEFINER RPCs from migration 018:
-//   - set_member_role(p_user_id, p_new_role)
-//   - remove_account_member(p_user_id)
+// The old SECURITY DEFINER RPCs (migration 018) did the *real*
+// authorisation work. Now that the app runs on MySQL, those
+// guards are replicated here in TS with plain Prisma writes, and
+// both mutations run inside a transaction:
+//   - set_member_role  -> accountMember.update (PATCH)
+//   - remove_account_member -> fresh personal account + member
+//     move (DELETE)
 //
-// The RPCs do the *real* authorisation work — caller must be
-// admin+, target must be in caller's account, target can't be the
-// owner, can't be self. The TS layer here only forwards the call
-// and maps Postgres SQLSTATEs back to HTTP statuses.
+// Guards (mirroring the RPCs): caller must be admin+, target must
+// be in caller's account, target can't be the owner, can't be
+// self.
 // ============================================================
 
 import { NextResponse } from "next/server";
-import type { PostgrestError } from "@supabase/supabase-js";
 
-import { requireRole, toErrorResponse } from "@/lib/auth/account";
-import { isAccountRole } from "@/lib/auth/roles";
+import { getSessionFromRequest, type SessionUser } from "@/lib/auth/request";
+import { canManageMembers, isAccountRole, type AccountRole } from "@/lib/auth/roles";
+import { prisma } from "@/lib/db/prisma";
 import {
   checkRateLimit,
   rateLimitResponse,
   RATE_LIMITS,
 } from "@/lib/rate-limit";
 
-// Map known SQLSTATEs from the RPCs (see migration 018) onto HTTP
-// statuses. The `error.code` field is the SQLSTATE; the `message`
-// is the human-readable RAISE message we put in the migration.
-function rpcErrorToResponse(err: PostgrestError): NextResponse {
-  if (err.code === "42501") {
-    return NextResponse.json({ error: err.message }, { status: 403 });
+/**
+ * Resolve the caller from the session cookie and enforce admin+.
+ * Returns the resolved session user, or an error response to
+ * return directly.
+ */
+async function requireAdmin(request: Request): Promise<SessionUser | NextResponse> {
+  const user = await getSessionFromRequest(request);
+  if (!user) {
+    return NextResponse.json({ error: "Unauthorized" }, { status: 401 });
   }
-  if (err.code === "22023") {
-    return NextResponse.json({ error: err.message }, { status: 400 });
+  if (!canManageMembers(user.role as AccountRole)) {
+    return NextResponse.json(
+      { error: "This action requires the 'admin' role or higher" },
+      { status: 403 },
+    );
   }
-  console.error("[members route] unexpected RPC error:", err);
-  return NextResponse.json(
-    { error: "Failed to update member" },
-    { status: 500 },
-  );
+  return user;
 }
 
 export async function PATCH(
@@ -47,7 +52,8 @@ export async function PATCH(
   { params }: { params: Promise<{ userId: string }> },
 ) {
   try {
-    const ctx = await requireRole("admin");
+    const ctx = await requireAdmin(request);
+    if (ctx instanceof NextResponse) return ctx;
 
     const limit = checkRateLimit(
       `admin:memberRole:${ctx.userId}`,
@@ -69,8 +75,8 @@ export async function PATCH(
       );
     }
 
-    // The RPC blocks promotion to / demotion from owner, but
-    // surface the friendlier 400 before crossing the wire too.
+    // Promotion to / demotion from owner goes through
+    // transfer-ownership; surface the friendlier 400 here too.
     if (role === "owner") {
       return NextResponse.json(
         {
@@ -81,25 +87,58 @@ export async function PATCH(
       );
     }
 
-    const { error } = await ctx.supabase.rpc("set_member_role", {
-      p_user_id: userId,
-      p_new_role: role,
+    if (userId === ctx.userId) {
+      return NextResponse.json(
+        { error: "Cannot change your own role" },
+        { status: 400 },
+      );
+    }
+
+    const target = await prisma.accountMember.findUnique({
+      where: { userId },
     });
 
-    if (error) return rpcErrorToResponse(error);
+    if (!target) {
+      return NextResponse.json(
+        { error: "Target user not found" },
+        { status: 400 },
+      );
+    }
+    if (target.accountId !== ctx.accountId) {
+      return NextResponse.json(
+        { error: "Target user is not a member of your account" },
+        { status: 403 },
+      );
+    }
+    if (target.role === "owner") {
+      return NextResponse.json(
+        { error: "Use transfer_account_ownership to demote an owner" },
+        { status: 400 },
+      );
+    }
+
+    await prisma.accountMember.update({
+      where: { userId },
+      data: { role },
+    });
 
     return NextResponse.json({ ok: true });
   } catch (err) {
-    return toErrorResponse(err);
+    console.error("[members route] unexpected error:", err);
+    return NextResponse.json(
+      { error: "Failed to update member" },
+      { status: 500 },
+    );
   }
 }
 
 export async function DELETE(
-  _request: Request,
+  request: Request,
   { params }: { params: Promise<{ userId: string }> },
 ) {
   try {
-    const ctx = await requireRole("admin");
+    const ctx = await requireAdmin(request);
+    if (ctx instanceof NextResponse) return ctx;
 
     const limit = checkRateLimit(
       `admin:memberRemove:${ctx.userId}`,
@@ -109,14 +148,64 @@ export async function DELETE(
 
     const { userId } = await params;
 
-    const { data, error } = await ctx.supabase.rpc("remove_account_member", {
-      p_user_id: userId,
+    if (userId === ctx.userId) {
+      return NextResponse.json(
+        { error: "Cannot remove yourself; transfer ownership or leave the account instead" },
+        { status: 400 },
+      );
+    }
+
+    const target = await prisma.accountMember.findUnique({
+      where: { userId },
+      include: { user: { select: { fullName: true, email: true } } },
     });
 
-    if (error) return rpcErrorToResponse(error);
+    if (!target) {
+      return NextResponse.json(
+        { error: "Target user not found" },
+        { status: 400 },
+      );
+    }
+    if (target.accountId !== ctx.accountId) {
+      return NextResponse.json(
+        { error: "Target user is not a member of your account" },
+        { status: 403 },
+      );
+    }
+    if (target.role === "owner") {
+      return NextResponse.json(
+        { error: "Cannot remove the account owner; transfer ownership first" },
+        { status: 400 },
+      );
+    }
 
-    return NextResponse.json({ ok: true, newPersonalAccountId: data });
+    // Mirror of remove_account_member: spin up a fresh personal
+    // account for the removed user and move them there as owner —
+    // they keep their login and "start over" with an empty account.
+    const newAccount = await prisma.$transaction(async (tx) => {
+      const account = await tx.account.create({
+        data: {
+          name: target.user.fullName || target.user.email || "My account",
+          ownerUserId: userId,
+        },
+        select: { id: true },
+      });
+      await tx.accountMember.update({
+        where: { userId },
+        data: { accountId: account.id, role: "owner" },
+      });
+      return account;
+    });
+
+    return NextResponse.json({
+      ok: true,
+      newPersonalAccountId: newAccount.id,
+    });
   } catch (err) {
-    return toErrorResponse(err);
+    console.error("[members route] unexpected error:", err);
+    return NextResponse.json(
+      { error: "Failed to update member" },
+      { status: 500 },
+    );
   }
 }

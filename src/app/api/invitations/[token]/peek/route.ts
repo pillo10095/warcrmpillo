@@ -11,11 +11,6 @@
 //     `?token=` would.
 //   - The plaintext token never crosses the DB boundary — we
 //     hash it in TS first and look up by `token_hash`.
-//   - The peek RPC is SECURITY DEFINER so it bypasses the RLS
-//     that would otherwise block an anonymous SELECT on
-//     `account_invitations`. It returns a fixed-shape JSON
-//     payload that never leaks columns beyond what the join
-//     page renders.
 //   - Per-IP rate limit pinches brute-force enumeration of
 //     tokens. With 256 bits of entropy the enumeration risk is
 //     theoretical, but rate limiting is cheap insurance.
@@ -23,13 +18,13 @@
 
 import { NextResponse } from "next/server";
 
-import { hashInviteToken } from "@/lib/auth/invitations";
+import { hashInviteToken } from "@/lib/auth/invites-db";
+import { prisma } from "@/lib/db/prisma";
 import {
   checkRateLimit,
   rateLimitResponse,
   RATE_LIMITS,
 } from "@/lib/rate-limit";
-import { createClient } from "@/lib/supabase/server";
 
 /**
  * Best-effort client IP. The `x-forwarded-for` header is what
@@ -68,20 +63,34 @@ export async function GET(
     );
   }
 
-  const supabase = await createClient();
-  const { data, error } = await supabase.rpc("peek_invitation", {
-    p_token_hash: hashInviteToken(token),
-  });
+  try {
+    const inv = await prisma.invitation.findUnique({
+      where: { tokenHash: hashInviteToken(token) },
+      select: {
+        role: true,
+        expiresAt: true,
+        acceptedAt: true,
+        account: { select: { name: true } },
+      },
+    });
 
-  if (error) {
-    console.error("[peek] rpc error:", error);
+    if (!inv) return NextResponse.json({ ok: false, reason: "not_found" });
+    if (inv.acceptedAt) return NextResponse.json({ ok: false, reason: "used" });
+    if (inv.expiresAt.getTime() <= Date.now()) {
+      return NextResponse.json({ ok: false, reason: "expired" });
+    }
+
+    return NextResponse.json({
+      ok: true,
+      account_name: inv.account.name,
+      role: inv.role,
+      expires_at: inv.expiresAt,
+    });
+  } catch (err) {
+    console.error("[peek] db error:", err);
     return NextResponse.json(
       { ok: false, reason: "server_error" },
       { status: 500 },
     );
   }
-
-  // The RPC always returns a json object — either ok:true with
-  // metadata or ok:false with a reason. Forward verbatim.
-  return NextResponse.json(data);
 }

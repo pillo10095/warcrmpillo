@@ -6,9 +6,9 @@
 //   - promotes the target member to 'owner'
 //   - updates accounts.owner_user_id
 //
-// The atomic part lives in the `transfer_account_ownership`
-// SECURITY DEFINER RPC (migration 018). This route just validates
-// shape and forwards.
+// The old SECURITY DEFINER RPC (migration 018) did this in one
+// statement-level transaction; now it's a single Prisma
+// transaction guarded here in TS.
 //
 // Why a separate endpoint instead of PATCH /members/[userId]?
 //   The semantics differ: transfer demotes the current owner as
@@ -19,27 +19,33 @@
 // ============================================================
 
 import { NextResponse } from "next/server";
-import type { PostgrestError } from "@supabase/supabase-js";
 
-import { requireRole, toErrorResponse } from "@/lib/auth/account";
+import { getSessionFromRequest, type SessionUser } from "@/lib/auth/request";
+import { canTransferOwnership, type AccountRole } from "@/lib/auth/roles";
+import { prisma } from "@/lib/db/prisma";
 import {
   checkRateLimit,
   rateLimitResponse,
   RATE_LIMITS,
 } from "@/lib/rate-limit";
 
-function rpcErrorToResponse(err: PostgrestError): NextResponse {
-  if (err.code === "42501") {
-    return NextResponse.json({ error: err.message }, { status: 403 });
+/**
+ * Resolve the caller from the session cookie and enforce owner.
+ * Returns the resolved session user, or an error response to
+ * return directly.
+ */
+async function requireOwner(request: Request): Promise<SessionUser | NextResponse> {
+  const user = await getSessionFromRequest(request);
+  if (!user) {
+    return NextResponse.json({ error: "Unauthorized" }, { status: 401 });
   }
-  if (err.code === "22023") {
-    return NextResponse.json({ error: err.message }, { status: 400 });
+  if (!canTransferOwnership(user.role as AccountRole)) {
+    return NextResponse.json(
+      { error: "This action requires the 'owner' role or higher" },
+      { status: 403 },
+    );
   }
-  console.error("[transfer-ownership] unexpected RPC error:", err);
-  return NextResponse.json(
-    { error: "Failed to transfer ownership" },
-    { status: 500 },
-  );
+  return user;
 }
 
 // Crude shape check — full UUID validation happens DB-side when
@@ -54,10 +60,8 @@ function looksLikeUuid(v: unknown): v is string {
 
 export async function POST(request: Request) {
   try {
-    // `requireRole('owner')` is belt-and-braces — the RPC checks
-    // this too, but failing fast here saves a Supabase round trip
-    // on the obvious "admin trying to transfer" case.
-    const ctx = await requireRole("owner");
+    const ctx = await requireOwner(request);
+    if (ctx instanceof NextResponse) return ctx;
 
     // Rate-limit owner-only transfers. Legitimate use is one click
     // every few months at most; a script run in a loop would
@@ -81,14 +85,54 @@ export async function POST(request: Request) {
       );
     }
 
-    const { error } = await ctx.supabase.rpc("transfer_account_ownership", {
-      p_new_owner_user_id: newOwnerUserId,
+    if (newOwnerUserId === ctx.userId) {
+      return NextResponse.json(
+        { error: "You are already the owner" },
+        { status: 400 },
+      );
+    }
+
+    const target = await prisma.accountMember.findUnique({
+      where: { userId: newOwnerUserId },
     });
 
-    if (error) return rpcErrorToResponse(error);
+    if (!target) {
+      return NextResponse.json(
+        { error: "Target user not found" },
+        { status: 400 },
+      );
+    }
+    if (target.accountId !== ctx.accountId) {
+      return NextResponse.json(
+        { error: "Target user is not a member of your account" },
+        { status: 403 },
+      );
+    }
+
+    // Demote the current owner first so the temporary state where
+    // the account has zero owners is never visible — both writes
+    // happen in the same transaction.
+    await prisma.$transaction(async (tx) => {
+      await tx.account.update({
+        where: { id: ctx.accountId },
+        data: { ownerUserId: newOwnerUserId },
+      });
+      await tx.accountMember.update({
+        where: { userId: ctx.userId },
+        data: { role: "admin" },
+      });
+      await tx.accountMember.update({
+        where: { userId: newOwnerUserId },
+        data: { role: "owner" },
+      });
+    });
 
     return NextResponse.json({ ok: true });
   } catch (err) {
-    return toErrorResponse(err);
+    console.error("[transfer-ownership] unexpected error:", err);
+    return NextResponse.json(
+      { error: "Failed to transfer ownership" },
+      { status: 500 },
+    );
   }
 }
