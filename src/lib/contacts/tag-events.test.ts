@@ -1,16 +1,11 @@
-import { beforeEach, describe, expect, it, vi } from 'vitest';
+import { afterEach, beforeEach, describe, expect, it, vi } from 'vitest';
 
 const mocks = vi.hoisted(() => ({
   add: vi.fn(),
-  dispatch: vi.fn(),
 }));
 
 vi.mock('./tag-write', () => ({
   addContactTagIfAbsent: mocks.add,
-}));
-
-vi.mock('@/lib/automations/engine', () => ({
-  runAutomationsForTrigger: mocks.dispatch,
 }));
 
 import {
@@ -20,40 +15,43 @@ import {
 } from './tag-events';
 
 const base = {
-  db: {} as never,
+  db: undefined,
   accountId: 'account-1',
   contactId: 'contact-1',
   tagId: 'tag-1',
 };
 
+let warn: ReturnType<typeof vi.spyOn>;
+
 beforeEach(() => {
   mocks.add.mockReset();
-  mocks.dispatch.mockReset();
-  mocks.dispatch.mockResolvedValue(undefined);
+  mocks.add.mockResolvedValue(true);
+  warn = vi.spyOn(console, 'warn').mockImplementation(() => {});
+});
+
+afterEach(() => {
+  warn.mockRestore();
 });
 
 describe('addContactTagAndDispatch', () => {
-  it('dispatches once for a newly inserted tag and propagates depth', async () => {
-    mocks.add.mockResolvedValue(true);
-
+  it('adds the tag and defers the automations dispatch (no-op, Task E)', async () => {
     const result = await addContactTagAndDispatch({
       ...base,
       context: { vars: { source: 'flow', _tag_chain_depth: 1 } },
     });
 
-    expect(result).toEqual({ added: true, dispatched: true });
-    expect(mocks.dispatch).toHaveBeenCalledWith({
+    expect(result).toEqual({ added: true, dispatched: false });
+    expect(mocks.add).toHaveBeenCalledWith(base.db, {
       accountId: 'account-1',
-      triggerType: 'tag_added',
       contactId: 'contact-1',
-      context: {
-        tag_id: 'tag-1',
-        vars: { source: 'flow', _tag_chain_depth: 2 },
-      },
+      tagId: 'tag-1',
     });
+    expect(warn).toHaveBeenCalledWith(
+      expect.stringContaining('tag_added dispatch deferred')
+    );
   });
 
-  it('does not dispatch when the tag already exists', async () => {
+  it('does not add or dispatch when the tag already exists', async () => {
     mocks.add.mockResolvedValue(false);
 
     await expect(addContactTagAndDispatch(base)).resolves.toEqual({
@@ -61,12 +59,10 @@ describe('addContactTagAndDispatch', () => {
       dispatched: false,
       reason: 'duplicate',
     });
-    expect(mocks.dispatch).not.toHaveBeenCalled();
+    expect(warn).not.toHaveBeenCalled();
   });
 
-  it('adds the tag but cuts a chain at the configured depth limit', async () => {
-    mocks.add.mockResolvedValue(true);
-
+  it('adds the tag but reports a cut chain at the depth limit', async () => {
     await expect(
       addContactTagAndDispatch({
         ...base,
@@ -77,24 +73,10 @@ describe('addContactTagAndDispatch', () => {
       dispatched: false,
       reason: 'max_depth',
     });
-    expect(mocks.dispatch).not.toHaveBeenCalled();
-  });
-
-  it('cuts an A-to-B-to-A tag chain before it can loop forever', async () => {
-    mocks.add.mockResolvedValue(true);
-    mocks.dispatch.mockImplementation(async (event) => {
-      const nextTag = event.context.tag_id === 'tag-a' ? 'tag-b' : 'tag-a';
-      await addContactTagAndDispatch({
-        ...base,
-        tagId: nextTag,
-        context: event.context,
-      });
-    });
-
-    await addContactTagAndDispatch({ ...base, tagId: 'tag-a' });
-
-    expect(mocks.dispatch).toHaveBeenCalledTimes(MAX_TAG_CHAIN_DEPTH);
-    expect(mocks.add).toHaveBeenCalledTimes(MAX_TAG_CHAIN_DEPTH + 1);
+    expect(warn).toHaveBeenCalledWith(
+      expect.stringContaining('chain depth limit reached'),
+      expect.objectContaining({ accountId: 'account-1', tagId: 'tag-1' })
+    );
   });
 });
 

@@ -1,4 +1,5 @@
-import type { SupabaseClient } from '@supabase/supabase-js';
+import { prisma } from '@/lib/db/prisma';
+import { isUniqueViolation } from './dedupe';
 
 export class ContactTagWriteError extends Error {
   readonly status: number;
@@ -17,32 +18,30 @@ interface ContactTagWriteInput {
 }
 
 async function assertContactAndTagOwnership(
-  db: SupabaseClient,
+  _db: unknown,
   input: ContactTagWriteInput
 ): Promise<void> {
-  const [contactResult, tagResult] = await Promise.all([
-    db
-      .from('contacts')
-      .select('id')
-      .eq('id', input.contactId)
-      .eq('account_id', input.accountId)
-      .maybeSingle(),
-    db
-      .from('tags')
-      .select('id')
-      .eq('id', input.tagId)
-      .eq('account_id', input.accountId)
-      .maybeSingle(),
-  ]);
+  try {
+    const [contact, tag] = await Promise.all([
+      prisma.contact.findFirst({
+        where: { id: input.contactId, accountId: input.accountId },
+        select: { id: true },
+      }),
+      prisma.tag.findFirst({
+        where: { id: input.tagId, accountId: input.accountId },
+        select: { id: true },
+      }),
+    ]);
 
-  if (contactResult.error || tagResult.error) {
+    if (!contact) {
+      throw new ContactTagWriteError('Contact not found', 404);
+    }
+    if (!tag) {
+      throw new ContactTagWriteError('Tag not found', 404);
+    }
+  } catch (error) {
+    if (error instanceof ContactTagWriteError) throw error;
     throw new ContactTagWriteError('Could not verify contact tag ownership');
-  }
-  if (!contactResult.data) {
-    throw new ContactTagWriteError('Contact not found', 404);
-  }
-  if (!tagResult.data) {
-    throw new ContactTagWriteError('Tag not found', 404);
   }
 }
 
@@ -52,41 +51,42 @@ async function assertContactAndTagOwnership(
  * duplicate insert is a no-op and must not emit a tag_added event.
  */
 export async function addContactTagIfAbsent(
-  db: SupabaseClient,
+  _db: unknown,
   input: ContactTagWriteInput
 ): Promise<boolean> {
-  await assertContactAndTagOwnership(db, input);
+  await assertContactAndTagOwnership(_db, input);
 
-  const { error } = await db
-    .from('contact_tags')
-    .insert({ contact_id: input.contactId, tag_id: input.tagId })
-    .select('id')
-    .maybeSingle();
-
-  if (error?.code === '23505') return false;
-  if (error) {
+  try {
+    await prisma.contactTag.create({
+      data: { contactId: input.contactId, tagId: input.tagId },
+      select: { id: true },
+    });
+    return true;
+  } catch (error) {
+    if (isUniqueViolation(error)) return false;
     throw new ContactTagWriteError(
-      `Failed to add contact tag: ${error.message}`
+      `Failed to add contact tag: ${
+        error instanceof Error ? error.message : String(error)
+      }`
     );
   }
-  return true;
 }
 
 export async function removeContactTag(
-  db: SupabaseClient,
+  _db: unknown,
   input: ContactTagWriteInput
 ): Promise<void> {
-  await assertContactAndTagOwnership(db, input);
+  await assertContactAndTagOwnership(_db, input);
 
-  const { error } = await db
-    .from('contact_tags')
-    .delete()
-    .eq('contact_id', input.contactId)
-    .eq('tag_id', input.tagId);
-
-  if (error) {
+  try {
+    await prisma.contactTag.deleteMany({
+      where: { contactId: input.contactId, tagId: input.tagId },
+    });
+  } catch (error) {
     throw new ContactTagWriteError(
-      `Failed to remove contact tag: ${error.message}`
+      `Failed to remove contact tag: ${
+        error instanceof Error ? error.message : String(error)
+      }`
     );
   }
 }

@@ -1,8 +1,55 @@
-import { describe, expect, it } from 'vitest';
+import { describe, expect, it, vi } from 'vitest';
 import type { SupabaseClient } from '@supabase/supabase-js';
 
 import { resolveConversationByPhone } from './resolve-conversation';
 import { SendMessageError } from './send-message';
+
+// Migration shim (Task B): the shared contact helpers are now
+// Prisma-backed and ignore the passed client, but
+// `resolveConversationByPhone` still drives its lookups through the
+// scripted Supabase stub below. Keep these two stubs reproducing the
+// pre-migration behavior until resolve-conversation itself migrates
+// (Task C).
+vi.mock('@/lib/contacts/dedupe', () => ({
+  isUniqueViolation: (e: unknown) =>
+    (e as { code?: string })?.code === '23505',
+  findExistingContact: async (db: {
+    from: (table: string) => {
+      select: () => { eq: () => { like: () => Promise<{ data: ContactRow[] | null; error: null }> } };
+      eq: () => { like: () => Promise<{ data: ContactRow[] | null; error: null }> };
+      like: () => Promise<{ data: ContactRow[] | null; error: null }>;
+    };
+  }) => {
+    const { data } = await db.from('contacts').select().eq().like();
+    return (data?.[0] ?? null) as ContactRow | null;
+  },
+}));
+
+vi.mock('@/lib/api/v1/contacts', () => {
+  class ContactError extends Error {
+    status: number;
+    constructor(message: string, status: number) {
+      super(message);
+      this.name = 'ContactError';
+      this.status = status;
+    }
+  }
+  return {
+    ContactError,
+    resolveAuditUserId: async (db: {
+      from: (table: string) => {
+        select: () => { eq: () => { maybeSingle: () => Promise<{ data: { user_id?: string } | null; error: null }> } };
+        eq: () => { maybeSingle: () => Promise<{ data: { user_id?: string } | null; error: null }> };
+        maybeSingle: () => Promise<{ data: { user_id?: string } | null; error: null }>;
+      };
+    }) => {
+      const { data } = await db.from('whatsapp_config').select().eq().maybeSingle();
+      const owner = data?.user_id;
+      if (!owner) throw new ContactError('Account owner could not be resolved', 500);
+      return owner;
+    },
+  };
+});
 
 // ------------------------------------------------------------
 // Chainable Supabase stub, scripted per table. Terminal methods

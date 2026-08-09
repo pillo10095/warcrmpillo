@@ -1,4 +1,4 @@
-import type { SupabaseClient } from "@supabase/supabase-js";
+import { prisma } from "@/lib/db/prisma";
 import { normalizePhone, phonesMatch } from "@/lib/whatsapp/phone-utils";
 
 /**
@@ -11,6 +11,11 @@ import { normalizePhone, phonesMatch } from "@/lib/whatsapp/phone-utils";
  * and enforces unique per account. `phonesMatch` adds trunk-prefix
  * tolerance (last-8-digit match) for the softer "possible duplicate"
  * surfaces.
+ *
+ * Prisma-backed (Task B): the client argument is kept on the public
+ * signatures so not-yet-migrated callers (webhook, resolve-conversation,
+ * client components) keep compiling; the queries hit `prisma` directly
+ * and are explicitly scoped by `accountId` (application-level RLS).
  */
 
 /** Canonical de-dup key for a phone string (digits only). */
@@ -33,7 +38,7 @@ export interface ExistingContact {
  * the small candidate set — the exact approach the webhook has used.
  */
 export async function findExistingContact(
-  db: SupabaseClient,
+  _db: unknown,
   accountId: string,
   phone: string,
 ): Promise<ExistingContact | null> {
@@ -42,17 +47,12 @@ export async function findExistingContact(
 
   const suffix = normalized.length >= 8 ? normalized.slice(-8) : normalized;
 
-  const { data, error } = await db
-    .from("contacts")
-    .select("*")
-    .eq("account_id", accountId)
-    .like("phone", `%${suffix}`);
+  const rows = await prisma.contact.findMany({
+    where: { accountId, phone: { endsWith: suffix } },
+    select: { id: true, phone: true, name: true },
+  });
 
-  if (error || !data) return null;
-
-  return (
-    (data as ExistingContact[]).find((c) => phonesMatch(c.phone, phone)) ?? null
-  );
+  return rows.find((c) => phonesMatch(c.phone, phone)) ?? null;
 }
 
 /**
@@ -65,13 +65,15 @@ export function isExactMatch(existing: ExistingContact, phone: string): boolean 
 }
 
 /**
- * True for a Postgres unique-constraint violation (SQLSTATE 23505).
+ * True for a unique-constraint violation — either the legacy Postgres
+ * SQLSTATE `23505` (Supabase callers) or Prisma's `P2002` (MySQL).
  * Used as the backstop when the DB unique index rejects a racing or
  * format-equal insert that slipped past the in-app check.
  */
 export function isUniqueViolation(error: unknown): boolean {
   if (!error || typeof error !== "object") return false;
-  return (error as { code?: string }).code === "23505";
+  const code = (error as { code?: string }).code;
+  return code === "23505" || code === "P2002";
 }
 
 /**

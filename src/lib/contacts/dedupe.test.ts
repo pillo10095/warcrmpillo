@@ -1,5 +1,11 @@
-import { describe, expect, it } from "vitest";
-import type { SupabaseClient } from "@supabase/supabase-js";
+import { beforeEach, describe, expect, it, vi } from "vitest";
+
+const mockDb = vi.hoisted(() => ({
+  contact: { findMany: vi.fn() },
+}));
+
+vi.mock("@/lib/db/prisma", () => ({ prisma: mockDb }));
+
 import {
   dedupeByPhone,
   findExistingContact,
@@ -7,6 +13,10 @@ import {
   isUniqueViolation,
   normalizeKey,
 } from "./dedupe";
+
+beforeEach(() => {
+  mockDb.contact.findMany.mockReset();
+});
 
 describe("normalizeKey", () => {
   it("strips every non-digit", () => {
@@ -35,11 +45,15 @@ describe("isExactMatch", () => {
 });
 
 describe("isUniqueViolation", () => {
-  it("detects Postgres 23505", () => {
+  it("detects Postgres 23505 (legacy Supabase errors)", () => {
     expect(isUniqueViolation({ code: "23505" })).toBe(true);
+  });
+  it("detects Prisma P2002 (unique constraint)", () => {
+    expect(isUniqueViolation({ code: "P2002" })).toBe(true);
   });
   it("is false for other errors / non-objects", () => {
     expect(isUniqueViolation({ code: "23502" })).toBe(false);
+    expect(isUniqueViolation({ code: "P2025" })).toBe(false);
     expect(isUniqueViolation(null)).toBe(false);
     expect(isUniqueViolation("boom")).toBe(false);
   });
@@ -67,31 +81,29 @@ describe("dedupeByPhone", () => {
 });
 
 describe("findExistingContact", () => {
-  // Minimal SupabaseClient stub: resolves the .from().select().eq().like()
-  // chain to a fixed candidate set.
-  function stubDb(rows: Array<{ id: string; phone: string }>): SupabaseClient {
-    const builder = {
-      select: () => builder,
-      eq: () => builder,
-      like: () => Promise.resolve({ data: rows, error: null }),
-    };
-    return { from: () => builder } as unknown as SupabaseClient;
-  }
-
-  it("returns a trunk-variant match via phonesMatch", async () => {
-    const db = stubDb([{ id: "c1", phone: "37063949836" }]);
-    const hit = await findExistingContact(db, "acct", "+370 063 949 836");
+  it("pre-filters by the account and phone suffix, then matches via phonesMatch", async () => {
+    mockDb.contact.findMany.mockResolvedValue([
+      { id: "c1", phone: "37063949836", name: null },
+    ]);
+    const hit = await findExistingContact(undefined, "acct", "+370 063 949 836");
     expect(hit?.id).toBe("c1");
+    expect(mockDb.contact.findMany).toHaveBeenCalledWith(
+      expect.objectContaining({
+        where: { accountId: "acct", phone: { endsWith: "63949836" } },
+      }),
+    );
   });
 
   it("returns null when no candidate matches", async () => {
-    const db = stubDb([{ id: "c1", phone: "15559999999" }]);
-    const hit = await findExistingContact(db, "acct", "+1 555-123-4567");
+    mockDb.contact.findMany.mockResolvedValue([
+      { id: "c1", phone: "15559999999", name: null },
+    ]);
+    const hit = await findExistingContact(undefined, "acct", "+1 555-123-4567");
     expect(hit).toBeNull();
   });
 
   it("returns null for an empty phone without querying", async () => {
-    const db = stubDb([{ id: "c1", phone: "15551234567" }]);
-    expect(await findExistingContact(db, "acct", "   ")).toBeNull();
+    expect(await findExistingContact(undefined, "acct", "   ")).toBeNull();
+    expect(mockDb.contact.findMany).not.toHaveBeenCalled();
   });
 });

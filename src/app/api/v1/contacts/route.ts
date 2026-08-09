@@ -6,15 +6,16 @@
 // supports `?search=` (name/phone) and `?tag=<tagId>` filters. Create
 // is find-or-create by phone: an existing match returns 200 with
 // `created: false`; a new row returns 201 with `created: true`.
+//
+// Prisma-backed (Task B): all queries are explicitly scoped by
+// `ctx.accountId` (application-level RLS).
 // ============================================================
+
+import type { Prisma } from '@prisma/client';
 
 import { requireApiKey } from '@/lib/auth/api-context';
 import { ok, okList, fail, toApiErrorResponse } from '@/lib/api/v1/respond';
-import {
-  parseListParams,
-  keysetFilter,
-  buildPage,
-} from '@/lib/api/v1/pagination';
+import { parseListParams, buildPage } from '@/lib/api/v1/pagination';
 import {
   CONTACT_SELECT,
   serializeContact,
@@ -24,6 +25,7 @@ import {
   resolveAuditUserId,
   ContactError,
 } from '@/lib/api/v1/contacts';
+import { prisma } from '@/lib/db/prisma';
 
 // PostgREST filter values are comma/paren-delimited; strip anything
 // that could break the `.or()` grammar before interpolating a search
@@ -40,52 +42,60 @@ export async function GET(request: Request) {
     const search = sanitizeSearch(url.searchParams.get('search') ?? '');
     const tag = url.searchParams.get('tag');
 
-    // When filtering by tag, add an aliased INNER join on contact_tags
-    // used purely for the WHERE — the parent is kept only if it has the
-    // tag. The main `contact_tags(tags(*))` embed still returns the
-    // contact's FULL tag set for serialization. This filters in one
-    // bounded query (paged by limit+1) instead of pre-fetching an
-    // unbounded id list into an `.in(...)`.
-    const selectClause = tag
-      ? `${CONTACT_SELECT}, tag_filter:contact_tags!inner(tag_id)`
-      : CONTACT_SELECT;
-
-    let query = ctx.supabase
-      .from('contacts')
-      .select(selectClause)
-      .eq('account_id', ctx.accountId);
+    // Search and the keyset walk are both OR-groups; combine them with
+    // AND so they never collide in a single `where.OR`.
+    const and: Prisma.ContactWhereInput[] = [];
+    const searchOr: Prisma.ContactWhereInput[] = [];
+    const keysetOr: Prisma.ContactWhereInput[] = [];
 
     if (search) {
-      query = query.or(`name.ilike.*${search}*,phone.ilike.*${search}*`);
+      searchOr.push(
+        { name: { contains: search } },
+        { phone: { contains: search } }
+      );
     }
 
-    if (tag) {
-      query = query.eq('tag_filter.tag_id', tag);
+    if (cursor) {
+      // Walks *past* the cursor row under a (created_at desc, id desc)
+      // ordering — the Prisma equivalent of the PostgREST keyset filter.
+      const at = new Date(cursor.createdAt);
+      keysetOr.push(
+        { createdAt: { lt: at } },
+        { AND: [{ createdAt: at }, { id: { lt: cursor.id } }] }
+      );
     }
 
-    query = query
-      .order('created_at', { ascending: false })
-      .order('id', { ascending: false })
-      .limit(limit + 1);
+    if (searchOr.length > 0) and.push({ OR: searchOr });
+    if (keysetOr.length > 0) and.push({ OR: keysetOr });
 
-    const kf = keysetFilter(cursor);
-    if (kf) query = query.or(kf);
+    const where: Prisma.ContactWhereInput = { accountId: ctx.accountId };
+    if (tag) where.contactTags = { some: { tagId: tag } };
+    if (and.length > 0) where.AND = and;
 
-    const { data, error } = await query;
-    if (error) {
+    let rows;
+    try {
+      rows = await prisma.contact.findMany({
+        where,
+        include: CONTACT_SELECT,
+        orderBy: [{ createdAt: 'desc' }, { id: 'desc' }],
+        take: limit + 1,
+      });
+    } catch (error) {
       console.error('[api/v1/contacts] list error:', error);
       return fail('internal', 'Failed to list contacts', 500);
     }
 
-    // Cast via unknown: the conditional `selectClause` (with the
-    // tag_filter alias) is a runtime string, so supabase-js can't infer
-    // a row type from it.
+    // buildPage expects the `created_at` ISO string the old PostgREST
+    // rows carried; feed it a projection, then serialize the originals.
     const { items, nextCursor } = buildPage(
-      (data ?? []) as unknown as Array<{ created_at: string; id: string }>,
+      rows.map((r) => ({ created_at: r.createdAt.toISOString(), id: r.id })),
       limit
     );
+    const byId = new Map(rows.map((r) => [r.id, r]));
     return okList(
-      items.map((r) => serializeContact(r as Record<string, unknown>)),
+      items.map((r) =>
+        serializeContact(byId.get(r.id) as unknown as Record<string, unknown>)
+      ),
       nextCursor
     );
   } catch (err) {
@@ -110,10 +120,10 @@ export async function POST(request: Request) {
       return fail('bad_request', "'phone' is required", 400);
     }
 
-    const auditUserId = await resolveAuditUserId(ctx.supabase, ctx.accountId);
+    const auditUserId = await resolveAuditUserId(undefined, ctx.accountId);
 
     const { id, created } = await findOrCreateContact(
-      ctx.supabase,
+      undefined,
       ctx.accountId,
       auditUserId,
       {
@@ -126,7 +136,7 @@ export async function POST(request: Request) {
 
     if (Array.isArray(body.tags)) {
       await setContactTags(
-        ctx.supabase,
+        undefined,
         ctx.accountId,
         auditUserId,
         id,
@@ -134,7 +144,7 @@ export async function POST(request: Request) {
       );
     }
 
-    const contact = await getContactById(ctx.supabase, ctx.accountId, id);
+    const contact = await getContactById(undefined, ctx.accountId, id);
     return ok(contact, created ? 201 : 200);
   } catch (err) {
     if (err instanceof ContactError) {
