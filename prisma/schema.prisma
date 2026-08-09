@@ -1,0 +1,139 @@
+generator client {
+  provider = "prisma-client-js"
+}
+
+datasource db {
+  provider = "mysql"
+  url      = env("DATABASE_URL")
+}
+
+model User {
+  id           String   @id @default(uuid()) @db.VarChar(36)
+  email        String   @unique @db.VarChar(255)
+  passwordHash String   @map("password_hash") @db.VarChar(255)
+  fullName     String   @map("full_name") @db.VarChar(255)
+  avatarUrl    String?  @map("avatar_url") @db.Text
+  createdAt    DateTime @default(now()) @map("created_at") @db.DateTime(3)
+  updatedAt    DateTime @updatedAt @map("updated_at") @db.DateTime(3)
+
+  sessions      Session[]
+  accountMember AccountMember?
+  @@map("users")
+}
+
+model Session {
+  id         String   @id @default(uuid()) @db.VarChar(36)
+  userId     String   @map("user_id") @db.VarChar(36)
+  tokenHash  String   @unique @map("token_hash") @db.VarChar(64)
+  expiresAt  DateTime @map("expires_at") @db.DateTime(3)
+  createdAt  DateTime @default(now()) @map("created_at") @db.DateTime(3)
+  lastSeenAt DateTime @default(now()) @map("last_seen_at") @db.DateTime(3)
+
+  user User @relation(fields: [userId], references: [id], onDelete: Cascade)
+
+  @@index([userId])
+  @@map("sessions")
+}
+
+model Account {
+  id              String   @id @default(uuid()) @db.VarChar(36)
+  name            String   @db.VarChar(255)
+  ownerUserId     String   @unique @map("owner_user_id") @db.VarChar(36)
+  defaultCurrency String   @default("USD") @map("default_currency") @db.VarChar(3)
+  createdAt       DateTime @default(now()) @map("created_at") @db.DateTime(3)
+  updatedAt       DateTime @updatedAt @map("updated_at") @db.DateTime(3)
+
+  members       AccountMember[]
+  invitations   Invitation[]
+  apiKeys       ApiKey[]
+  webhookEndpoints WebhookEndpoint[]
+  @@map("accounts")
+}
+
+model AccountMember {
+  userId    String   @id @map("user_id") @db.VarChar(36)
+  accountId String   @map("account_id") @db.VarChar(36)
+  role      AccountRole
+  createdAt DateTime @default(now()) @map("created_at") @db.DateTime(3)
+
+  user    User    @relation(fields: [userId], references: [id], onDelete: Cascade)
+  account Account @relation(fields: [accountId], references: [id], onDelete: Cascade)
+
+  @@index([accountId])
+  @@map("account_members")
+}
+
+enum AccountRole {
+  owner
+  admin
+  agent
+  viewer
+}
+
+model Invitation {
+  id             String    @id @default(uuid()) @db.VarChar(36)
+  accountId      String    @map("account_id") @db.VarChar(36)
+  tokenHash      String    @unique @map("token_hash") @db.VarChar(64)
+  role           AccountRole
+  createdByUserId String?  @map("created_by_user_id") @db.VarChar(36)
+  label          String?   @db.VarChar(255)
+  createdAt      DateTime  @default(now()) @map("created_at") @db.DateTime(3)
+  expiresAt      DateTime  @map("expires_at") @db.DateTime(3)
+  acceptedAt     DateTime? @map("accepted_at") @db.DateTime(3)
+  acceptedByUserId String? @map("accepted_by_user_id") @db.VarChar(36)
+
+  account Account @relation(fields: [accountId], references: [id], onDelete: Cascade)
+
+  @@index([accountId])
+  @@map("account_invitations")
+}
+
+model ApiKey {
+  id         String   @id @default(uuid()) @db.VarChar(36)
+  accountId  String   @map("account_id") @db.VarChar(36)
+  createdBy  String?  @map("created_by") @db.VarChar(36)
+  name       String   @db.VarChar(255)
+  keyPrefix  String   @map("key_prefix") @db.VarChar(64)
+  keyHash    String   @unique @map("key_hash") @db.VarChar(64)
+  scopes     String   @default("[]") @db.VarChar(2048)
+  lastUsedAt DateTime? @map("last_used_at") @db.DateTime(3)
+  expiresAt  DateTime? @map("expires_at") @db.DateTime(3)
+  revokedAt  DateTime? @map("revoked_at") @db.DateTime(3)
+  createdAt  DateTime @default(now()) @map("created_at") @db.DateTime(3)
+
+  account Account @relation(fields: [accountId], references: [id], onDelete: Cascade)
+
+  @@index([accountId])
+  @@map("api_keys")
+}
+
+model FileRecord {
+  id           String   @id @default(uuid()) @db.VarChar(36)
+  accountId    String   @map("account_id") @db.VarChar(36)
+  originalName String   @map("original_name") @db.VarChar(255)
+  mime         String   @db.VarChar(127)
+  size         Int
+  diskPath     String   @map("disk_path") @db.VarChar(512)
+  createdAt    DateTime @default(now()) @map("created_at") @db.DateTime(3)
+
+  @@index([accountId])
+  @@map("files")
+}
+
+model WebhookEndpoint {
+  id           String    @id @default(uuid()) @db.VarChar(36)
+  accountId    String    @map("account_id") @db.VarChar(36)
+  createdBy    String?   @map("created_by") @db.VarChar(36)
+  url          String    @db.VarChar(512)
+  secret       String    @db.Text
+  events       String    @default("[]") @db.VarChar(2048)
+  isActive     Boolean   @default(true) @map("is_active")
+  lastDeliveryAt DateTime? @map("last_delivery_at") @db.DateTime(3)
+  failureCount Int       @default(0) @map("failure_count")
+  createdAt    DateTime  @default(now()) @map("created_at") @db.DateTime(3)
+
+  account Account @relation(fields: [accountId], references: [id], onDelete: Cascade)
+
+  @@index([accountId])
+  @@map("webhook_endpoints")
+}
