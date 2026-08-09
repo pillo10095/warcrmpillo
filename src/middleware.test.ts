@@ -1,113 +1,80 @@
-import { afterEach, beforeEach, describe, expect, it, vi } from "vitest";
+import { beforeEach, describe, expect, it, vi } from "vitest";
 import { NextRequest } from "next/server";
+import type { SessionUser } from "@/lib/auth/request";
 
-// --- Scenario knobs the mock reads -----------------------------------------
-// `mockUser`         — what getUser() resolves to (a refreshed session ⇒ user,
-//                      or null for the logged-out path).
-// `refreshedCookies` — cookies Supabase writes via setAll() during getUser(),
-//                      i.e. the freshly *rotated* auth token. The whole point
-//                      of the test is that these must survive onto whatever
-//                      response the middleware returns — including redirects.
-let mockUser: { id: string } | null = null;
-let refreshedCookies: Array<{
-  name: string;
-  value: string;
-  options: Record<string, unknown>;
-}> = [];
+let mockSession: SessionUser | null = null;
 
-vi.mock("@supabase/ssr", () => ({
-  createServerClient: (
-    _url: string,
-    _key: string,
-    opts: {
-      cookies: { setAll: (c: typeof refreshedCookies) => void };
-    },
-  ) => ({
-    auth: {
-      // Mirrors real auth-js: an expired access token is transparently
-      // refreshed inside getUser(), which rotates the refresh token and
-      // pushes the new cookies through setAll() before resolving.
-      getUser: async () => {
-        if (refreshedCookies.length) opts.cookies.setAll(refreshedCookies);
-        return { data: { user: mockUser } };
-      },
-    },
-  }),
+vi.mock("@/lib/auth/request", () => ({
+  getSessionFromRequest: vi.fn(async () => mockSession),
 }));
 
-// Imported after the mock is registered.
 const { middleware } = await import("./middleware");
 
 beforeEach(() => {
-  process.env.NEXT_PUBLIC_SUPABASE_URL = "https://test.supabase.co";
-  process.env.NEXT_PUBLIC_SUPABASE_ANON_KEY = "anon-key";
-  mockUser = null;
-  refreshedCookies = [];
+  mockSession = null;
 });
 
-afterEach(() => vi.clearAllMocks());
+const SESSION: SessionUser = { userId: "user-1", accountId: "acct-1", role: "owner" };
 
-const ROTATED = {
-  name: "sb-test-auth-token",
-  value: "rotated-refresh-token",
-  options: { path: "/", httpOnly: true },
-};
+describe("middleware — MySQL-backed session auth", () => {
+  it("allows an authenticated user on a protected page", async () => {
+    mockSession = SESSION;
 
-describe("middleware — refreshed auth cookies survive redirects", () => {
-  it("carries the rotated token when redirecting a signed-in user off /login", async () => {
-    mockUser = { id: "user-1" };
-    refreshedCookies = [ROTATED];
+    const res = await middleware(new NextRequest("https://app.test/dashboard"));
 
-    const res = await middleware(
-      new NextRequest("https://app.test/login"),
-    );
-
-    // Redirect to /dashboard…
-    expect(res.status).toBe(307);
-    expect(res.headers.get("location")).toContain("/dashboard");
-    // …and the rotated cookie MUST ride along, otherwise the browser keeps
-    // replaying the now-consumed refresh token and the session wedges until
-    // the user manually clears cookies.
-    expect(res.cookies.get(ROTATED.name)?.value).toBe(ROTATED.value);
+    expect(res.headers.get("location")).toBeNull();
   });
 
-  it("carries the rotated token when redirecting an unauth user to /login", async () => {
-    mockUser = null;
-    // Even on the logged-out path getUser() may emit cookie writes (e.g.
-    // clearing a dead session); those must not be dropped on the redirect.
-    refreshedCookies = [{ ...ROTATED, value: "cleared" }];
-
-    const res = await middleware(
-      new NextRequest("https://app.test/dashboard"),
-    );
+  it("redirects an unauthenticated user on a protected page to /login", async () => {
+    const res = await middleware(new NextRequest("https://app.test/dashboard"));
 
     expect(res.status).toBe(307);
     expect(res.headers.get("location")).toContain("/login");
-    expect(res.cookies.get(ROTATED.name)?.value).toBe("cleared");
   });
 
-  it("redirects a signed-in user with an invite token to /join/<token>", async () => {
-    mockUser = { id: "user-1" };
-    refreshedCookies = [ROTATED];
+  it("redirects an authenticated user on an auth page to /dashboard", async () => {
+    mockSession = SESSION;
+
+    const res = await middleware(new NextRequest("https://app.test/login"));
+
+    expect(res.status).toBe(307);
+    expect(res.headers.get("location")).toContain("/dashboard");
+  });
+
+  it("redirects an authenticated user with an invite token to /join/<token>", async () => {
+    mockSession = SESSION;
 
     const res = await middleware(
       new NextRequest("https://app.test/login?invite=abc123"),
     );
 
     expect(res.headers.get("location")).toContain("/join/abc123");
-    expect(res.cookies.get(ROTATED.name)?.value).toBe(ROTATED.value);
   });
 
-  it("passes through (no redirect) for a signed-in user on a protected page", async () => {
-    mockUser = { id: "user-1" };
-    refreshedCookies = [ROTATED];
-
+  it("returns 401 JSON for an unauthenticated whatsapp api request", async () => {
     const res = await middleware(
-      new NextRequest("https://app.test/dashboard"),
+      new NextRequest("https://app.test/api/whatsapp/messages"),
     );
 
-    // No redirect — the normal NextResponse.next() already carries cookies.
+    expect(res.status).toBe(401);
+    await expect(res.json()).resolves.toEqual({ error: "Unauthorized" });
+  });
+
+  it("does not block whatsapp webhooks when unauthenticated", async () => {
+    const res = await middleware(
+      new NextRequest("https://app.test/api/whatsapp/webhook"),
+    );
+
+    expect(res.status).not.toBe(401);
     expect(res.headers.get("location")).toBeNull();
-    expect(res.cookies.get(ROTATED.name)?.value).toBe(ROTATED.value);
+  });
+
+  it("does not redirect /api/auth routes when unauthenticated", async () => {
+    const res = await middleware(
+      new NextRequest("https://app.test/api/auth/login"),
+    );
+
+    expect(res.status).not.toBe(307);
+    expect(res.headers.get("location")).toBeNull();
   });
 });
