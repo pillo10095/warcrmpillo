@@ -13,12 +13,19 @@
 // account_id-tenancy / user_id-audit split) so a contact created via
 // the API is indistinguishable from one created by an inbound message.
 //
+// Prisma-backed (Task D): the `db` argument on the public signature is
+// kept so not-yet-migrated callers keep compiling — it is ignored by
+// this file; every query hits the `prisma` singleton, scoped by
+// `accountId` (application-level RLS). The shared helpers
+// (`findExistingContact`, `resolveAuditUserId`) are Prisma-backed too
+// and accept the now-ignored client.
+//
 // Audit user: created rows need a NOT NULL `user_id`. As with the
 // webhook (where there's no logged-in human either), we attribute
 // them to the WhatsApp config owner — a stable account-level default.
 // ============================================================
 
-import type { SupabaseClient } from '@supabase/supabase-js';
+import { prisma } from '@/lib/db/prisma';
 
 import { findExistingContact, isUniqueViolation } from '@/lib/contacts/dedupe';
 import { sanitizePhoneForMeta, isValidE164 } from '@/lib/whatsapp/phone-utils';
@@ -39,7 +46,7 @@ export interface ResolvedConversation {
  * WhatsApp config, or a DB failure.
  */
 export async function resolveConversationByPhone(
-  db: SupabaseClient,
+  db: unknown,
   accountId: string,
   phone: string,
   name?: string | null
@@ -55,11 +62,10 @@ export async function resolveConversationByPhone(
 
   // Fail fast (and create nothing) when the account has no WhatsApp
   // connected — the same error the send would raise anyway.
-  const { data: config } = await db
-    .from('whatsapp_config')
-    .select('id')
-    .eq('account_id', accountId)
-    .maybeSingle();
+  const config = await prisma.whatsAppConfig.findFirst({
+    where: { accountId },
+    select: { id: true },
+  });
   if (!config) {
     throw new SendMessageError(
       'whatsapp_not_configured',
@@ -92,24 +98,25 @@ export async function resolveConversationByPhone(
   if (existing) {
     contactId = existing.id;
     if (name && name !== existing.name) {
-      await db
-        .from('contacts')
-        .update({ name, updated_at: new Date().toISOString() })
-        .eq('id', existing.id);
+      await prisma.contact.update({
+        where: { id: existing.id },
+        data: { name, updatedAt: new Date() },
+      });
     }
   } else {
-    const { data: created, error: createErr } = await db
-      .from('contacts')
-      .insert({
-        account_id: accountId,
-        user_id: ownerUserId,
-        phone: sanitized,
-        name: name || sanitized,
-      })
-      .select('id')
-      .single();
-
-    if (createErr || !created) {
+    try {
+      const created = await prisma.contact.create({
+        data: {
+          accountId,
+          userId: ownerUserId,
+          phone: sanitized,
+          name: name || sanitized,
+        },
+        select: { id: true },
+      });
+      contactId = created.id;
+      contactCreated = true;
+    } catch (createErr) {
       // Lost a race against a concurrent inbound/API create — the
       // unique index (migration 022) rejected the duplicate. Re-resolve.
       if (isUniqueViolation(createErr)) {
@@ -130,9 +137,6 @@ export async function resolveConversationByPhone(
         );
         throw new SendMessageError('db_error', 'Failed to create contact', 500);
       }
-    } else {
-      contactId = created.id;
-      contactCreated = true;
     }
   }
 
@@ -155,58 +159,51 @@ export async function resolveConversationByPhone(
 /**
  * Find (oldest-first) or create the single conversation for
  * `(accountId, contactId)`. Handles the unique-index race the same way
- * the inbound webhook does: on a 23505 from a concurrent create,
+ * the inbound webhook does: on a P2002/23505 from a concurrent create,
  * re-resolve the winning row rather than failing the send.
  */
 async function findOrCreateConversationRow(
-  db: SupabaseClient,
+  _db: unknown,
   accountId: string,
   contactId: string,
   ownerUserId: string
 ): Promise<string> {
-  const { data: existing, error: findErr } = await db
-    .from('conversations')
-    .select('id')
-    .eq('account_id', accountId)
-    .eq('contact_id', contactId)
-    .order('created_at', { ascending: true })
-    .limit(1);
-
-  if (findErr) {
+  let existing: { id: string } | null;
+  try {
+    existing = await prisma.conversation.findFirst({
+      where: { accountId, contactId },
+      orderBy: { createdAt: 'asc' },
+      select: { id: true },
+    });
+  } catch (findErr) {
     console.error('[resolve-conversation] conversation lookup error:', findErr);
     throw new SendMessageError('db_error', 'Failed to resolve conversation', 500);
   }
 
-  if (existing && existing.length > 0) {
-    return existing[0].id;
+  if (existing) {
+    return existing.id;
   }
 
-  const { data: newConv, error: convErr } = await db
-    .from('conversations')
-    .insert({
-      account_id: accountId,
-      user_id: ownerUserId,
-      contact_id: contactId,
-    })
-    .select('id')
-    .single();
-
-  if (convErr || !newConv) {
+  try {
+    const created = await prisma.conversation.create({
+      data: { accountId, userId: ownerUserId, contactId },
+      select: { id: true },
+    });
+    return created.id;
+  } catch (convErr) {
     if (isUniqueViolation(convErr)) {
-      const { data: raced } = await db
-        .from('conversations')
-        .select('id')
-        .eq('account_id', accountId)
-        .eq('contact_id', contactId)
-        .order('created_at', { ascending: true })
-        .limit(1);
-      if (raced && raced.length > 0) {
-        return raced[0].id;
+      const raced = await prisma.conversation
+        .findFirst({
+          where: { accountId, contactId },
+          orderBy: { createdAt: 'asc' },
+          select: { id: true },
+        })
+        .catch(() => null);
+      if (raced) {
+        return raced.id;
       }
     }
     console.error('[resolve-conversation] conversation create error:', convErr);
     throw new SendMessageError('db_error', 'Failed to create conversation', 500);
   }
-
-  return newConv.id;
 }
