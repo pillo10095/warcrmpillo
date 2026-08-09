@@ -4,14 +4,13 @@
 //
 // This is the machine-to-machine counterpart of `getCurrentAccount`
 // (cookie session → account). Where the dashboard authenticates a
-// human via Supabase cookies, the public API authenticates a caller
+// human via cookie session, the public API authenticates a caller
 // via `Authorization: Bearer wacrm_live_…`.
 //
 // Calling convention — every `/api/v1` route does:
 //
 //   try {
 //     const ctx = await requireApiKey(request, "messages:send");
-//     // ctx.supabase   — service-role client (no user session exists)
 //     // ctx.accountId  — the key's account; scope every query by it
 //     // ctx.scopes     — granted scopes
 //     // ctx.keyId      — for logging / the rate-limit bucket
@@ -19,17 +18,16 @@
 //     return toApiErrorResponse(err);   // maps ApiError → envelope
 //   }
 //
-// Why a service-role client: an API caller has no Supabase session,
-// so there's no `auth.uid()` for RLS to match. The key lookup itself
-// establishes the account; from there every downstream query MUST be
-// explicitly filtered by `ctx.accountId` (the same discipline the
-// dashboard's send route already follows). The key never escalates
-// past its own account because the account is fixed at lookup time.
+// The key hash lookup runs against MySQL (see `@/lib/api-keys/store`).
+// The hash is the only credential and establishes the account; from
+// there every downstream query MUST be explicitly filtered by
+// `ctx.accountId` (the application-level replacement for RLS). The key
+// never escalates past its own account because the account is fixed at
+// lookup time.
 // ============================================================
 
 import type { SupabaseClient } from '@supabase/supabase-js';
 
-import { supabaseAdmin } from '@/lib/flows/admin-client';
 import { findActiveKeyByHash, touchLastUsed } from '@/lib/api-keys/store';
 import { hashApiKey, looksLikeApiKey } from '@/lib/api-keys/keys';
 import { hasScope, type ApiScope } from '@/lib/api-keys/scopes';
@@ -39,7 +37,13 @@ import { checkRateLimit, RATE_LIMITS } from '@/lib/rate-limit';
 export interface ApiKeyContext {
   /** Discriminant — lets shared logic tell key auth from cookie auth. */
   authType: 'api_key';
-  /** Service-role Supabase client. RLS-bypassing; scope by accountId. */
+  /**
+   * Compatibility stub for the not-yet-migrated CRM v1 routes
+   * (contacts / conversations / messages / broadcasts), which still
+   * expect a Supabase client. The auth path no longer touches
+   * Supabase — this is ALWAYS null at runtime, and is deleted when
+   * those routes migrate to Prisma.
+   */
   supabase: SupabaseClient;
   /** The account this key belongs to. */
   accountId: string;
@@ -109,10 +113,13 @@ export async function requireApiKey(
 
   return {
     authType: 'api_key',
-    supabase: supabaseAdmin(),
-    accountId: row.account_id,
+    // Always null — see the interface comment. Cast only because the
+    // field's type is pinned to `SupabaseClient` so the deferred CRM
+    // v1 routes keep compiling until they migrate to Prisma.
+    supabase: null as unknown as SupabaseClient,
+    accountId: row.accountId,
     keyId: row.id,
     scopes: row.scopes,
-    createdBy: row.created_by,
+    createdBy: row.createdBy,
   };
 }

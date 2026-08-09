@@ -11,10 +11,11 @@ import { requireApiKey } from '@/lib/auth/api-context';
 import { ok, fail, toApiErrorResponse } from '@/lib/api/v1/respond';
 import { normalizeEvents } from '@/lib/webhooks/events';
 import {
-  WEBHOOK_PUBLIC_COLUMNS,
-  serializeWebhookEndpoint,
+  serializePrismaWebhookEndpoint,
   normalizeWebhookUrl,
 } from '@/lib/webhooks/endpoints';
+import { prisma } from '@/lib/db/prisma';
+import type { Prisma } from '@prisma/client';
 
 export async function GET(
   request: Request,
@@ -24,20 +25,18 @@ export async function GET(
     const ctx = await requireApiKey(request, 'webhooks:manage');
     const { id } = await params;
 
-    const { data, error } = await ctx.supabase
-      .from('webhook_endpoints')
-      .select(WEBHOOK_PUBLIC_COLUMNS)
-      .eq('id', id)
-      .eq('account_id', ctx.accountId)
-      .maybeSingle();
-
-    if (error) {
+    let data;
+    try {
+      data = await prisma.webhookEndpoint.findFirst({
+        where: { id, accountId: ctx.accountId },
+      });
+    } catch (error) {
       console.error('[api/v1/webhooks] read error:', error);
       return fail('internal', 'Failed to read webhook', 500);
     }
     if (!data) return fail('not_found', 'Webhook not found', 404);
 
-    return ok(serializeWebhookEndpoint(data as Record<string, unknown>));
+    return ok(serializePrismaWebhookEndpoint(data));
   } catch (err) {
     return toApiErrorResponse(err);
   }
@@ -59,7 +58,7 @@ export async function PATCH(
       return fail('bad_request', 'Request body must be a JSON object', 400);
     }
 
-    const updates: Record<string, unknown> = {};
+    const updates: Prisma.WebhookEndpointUpdateInput = {};
 
     if ('url' in body) {
       const url = normalizeWebhookUrl(body.url);
@@ -78,40 +77,40 @@ export async function PATCH(
           400
         );
       }
-      updates.events = events;
+      updates.events = JSON.stringify(events);
     }
 
     if ('is_active' in body) {
       if (typeof body.is_active !== 'boolean') {
         return fail('bad_request', "'is_active' must be a boolean", 400);
       }
-      updates.is_active = body.is_active;
+      updates.isActive = body.is_active;
       // Re-enabling a disabled endpoint clears its failure streak so it
       // isn't instantly re-disabled by a single stale failure.
-      if (body.is_active === true) updates.failure_count = 0;
+      if (body.is_active === true) updates.failureCount = 0;
     }
 
     if (Object.keys(updates).length === 0) {
       return fail('bad_request', 'No updatable fields provided', 400);
     }
 
-    // Scope the update by account_id so a foreign id touches nothing;
-    // the returned row (null when unmatched) drives the 404.
-    const { data, error } = await ctx.supabase
-      .from('webhook_endpoints')
-      .update(updates)
-      .eq('id', id)
-      .eq('account_id', ctx.accountId)
-      .select(WEBHOOK_PUBLIC_COLUMNS)
-      .maybeSingle();
+    // Scope the lookup by account_id so a foreign id touches nothing;
+    // the 404 (when unmatched) is the same shape as before.
+    try {
+      const existing = await prisma.webhookEndpoint.findFirst({
+        where: { id, accountId: ctx.accountId },
+      });
+      if (!existing) return fail('not_found', 'Webhook not found', 404);
 
-    if (error) {
+      const data = await prisma.webhookEndpoint.update({
+        where: { id },
+        data: updates,
+      });
+      return ok(serializePrismaWebhookEndpoint(data));
+    } catch (error) {
       console.error('[api/v1/webhooks] update error:', error);
       return fail('internal', 'Failed to update webhook', 500);
     }
-    if (!data) return fail('not_found', 'Webhook not found', 404);
-
-    return ok(serializeWebhookEndpoint(data as Record<string, unknown>));
   } catch (err) {
     return toApiErrorResponse(err);
   }
@@ -125,21 +124,16 @@ export async function DELETE(
     const ctx = await requireApiKey(request, 'webhooks:manage');
     const { id } = await params;
 
-    const { data, error } = await ctx.supabase
-      .from('webhook_endpoints')
-      .delete()
-      .eq('id', id)
-      .eq('account_id', ctx.accountId)
-      .select('id')
-      .maybeSingle();
-
-    if (error) {
+    try {
+      const { count } = await prisma.webhookEndpoint.deleteMany({
+        where: { id, accountId: ctx.accountId },
+      });
+      if (count === 0) return fail('not_found', 'Webhook not found', 404);
+      return ok({ id, deleted: true });
+    } catch (error) {
       console.error('[api/v1/webhooks] delete error:', error);
       return fail('internal', 'Failed to delete webhook', 500);
     }
-    if (!data) return fail('not_found', 'Webhook not found', 404);
-
-    return ok({ id: data.id, deleted: true });
   } catch (err) {
     return toApiErrorResponse(err);
   }

@@ -8,6 +8,8 @@
 
 import { randomBytes } from 'node:crypto';
 
+import type { WebhookEndpoint } from '@prisma/client';
+
 /** Secret prefix — self-identifying, like `wacrm_live_` for keys. */
 export const WEBHOOK_SECRET_PREFIX = 'whsec_';
 
@@ -45,6 +47,36 @@ export function serializeWebhookEndpoint(
     last_delivery_at: (row.last_delivery_at as string | null) ?? null,
     failure_count: (row.failure_count as number | null) ?? 0,
     created_at: row.created_at as string,
+  };
+}
+
+/** Parse the JSON-serialized `events` column back into a string list. */
+function parseStoredEvents(raw: string): string[] {
+  try {
+    const parsed = JSON.parse(raw);
+    return Array.isArray(parsed) ? parsed : [];
+  } catch {
+    return [];
+  }
+}
+
+/**
+ * Project a Prisma `webhookEndpoint` row (camelCase, JSON-encoded
+ * `events`) into the public API shape. Supabase rows went through
+ * `serializeWebhookEndpoint`; this is the MySQL-store equivalent,
+ * keeping the wire contract identical.
+ */
+export function serializePrismaWebhookEndpoint(
+  row: WebhookEndpoint
+): ApiWebhookEndpoint {
+  return {
+    id: row.id,
+    url: row.url,
+    events: parseStoredEvents(row.events),
+    is_active: row.isActive,
+    last_delivery_at: row.lastDeliveryAt?.toISOString() ?? null,
+    failure_count: row.failureCount,
+    created_at: row.createdAt.toISOString(),
   };
 }
 
