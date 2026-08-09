@@ -4,7 +4,6 @@ import { Suspense, useState } from "react";
 import { useSearchParams } from "next/navigation";
 import Link from "next/link";
 import { useTranslations } from "next-intl";
-import { createClient } from "@/lib/supabase/client";
 import { Button } from "@/components/ui/button";
 import { Input } from "@/components/ui/input";
 import { Label } from "@/components/ui/label";
@@ -42,32 +41,33 @@ function LoginPageInner() {
   const [password, setPassword] = useState("");
   const [error, setError] = useState<string | null>(null);
   const [loading, setLoading] = useState(false);
-  const supabase = createClient();
 
   const handleLogin = async (e: React.FormEvent) => {
     e.preventDefault();
     setError(null);
     setLoading(true);
 
-    const { error } = await supabase.auth.signInWithPassword({
-      email,
-      password,
+    const res = await fetch("/api/auth/login", {
+      method: "POST",
+      headers: { "Content-Type": "application/json" },
+      body: JSON.stringify({ email, password }),
     });
 
-    if (error) {
-      setError(error.message);
+    if (!res.ok) {
+      const data = await res.json().catch(() => ({}));
+      setError(data.error ?? "Login failed");
       setLoading(false);
       return;
     }
 
     // Full-page navigation (not router.push) so the browser issues a
-    // fresh top-level request that carries the just-written Supabase
-    // auth cookies to the middleware gating /dashboard. A soft
-    // client-side navigation can reach the protected route before the
-    // server observes the new session, so the middleware bounces it
-    // back to /login — which looks like the page "just refreshing"
-    // instead of signing in (issue #365). Mirrors the deliberate full
-    // reload the invite-accept flow already uses in join/[token].
+    // fresh top-level request that carries the just-written session
+    // cookie to the middleware gating /dashboard. A soft client-side
+    // navigation can reach the protected route before the server
+    // observes the new session, so the middleware bounces it back to
+    // /login — which looks like the page "just refreshing" instead of
+    // signing in. Mirrors the deliberate full reload the invite-accept
+    // flow already uses in join/[token].
     const destination = inviteToken
       ? `/join/${encodeURIComponent(inviteToken)}`
       : "/dashboard";
