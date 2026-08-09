@@ -116,25 +116,28 @@ export function ProfileForm() {
     try {
       let nextAvatarUrl: string | null = profile.avatar_url ?? null;
 
-      // Upload a newly-staged image, if any.
+      // Upload a newly-staged image, if any, to the local-disk store.
+      // The `/api/files` route resolves the session server-side and
+      // returns an app-relative URL the browser can fetch same-origin.
       if (pendingAvatar) {
-        const ext =
-          pendingAvatar.name.split('.').pop()?.toLowerCase() || 'png';
-        const path = `${user.id}/avatar-${Date.now()}.${ext}`;
-        const { error: uploadError } = await supabase.storage
-          .from('avatars')
-          .upload(path, pendingAvatar, {
-            cacheControl: '3600',
-            upsert: true,
-            contentType: pendingAvatar.type,
-          });
-        if (uploadError) {
-          throw new Error(t('uploadFailed', { message: uploadError.message }));
+        const formData = new FormData();
+        formData.append('file', pendingAvatar);
+        const res = await fetch('/api/files', {
+          method: 'POST',
+          body: formData,
+        });
+        const data = (await res.json().catch(() => null)) as {
+          url?: string;
+          error?: string;
+        } | null;
+        if (!res.ok || !data?.url) {
+          throw new Error(
+            t('uploadFailed', {
+              message: data?.error ?? `HTTP ${res.status}`,
+            }),
+          );
         }
-        const {
-          data: { publicUrl },
-        } = supabase.storage.from('avatars').getPublicUrl(path);
-        nextAvatarUrl = publicUrl;
+        nextAvatarUrl = data.url;
       } else if (removeAvatar) {
         nextAvatarUrl = null;
       }
