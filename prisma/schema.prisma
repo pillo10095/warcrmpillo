@@ -18,6 +18,7 @@ model User {
 
   sessions      Session[]
   accountMember AccountMember?
+
   @@map("users")
 }
 
@@ -43,18 +44,25 @@ model Account {
   createdAt       DateTime @default(now()) @map("created_at") @db.DateTime(3)
   updatedAt       DateTime @updatedAt @map("updated_at") @db.DateTime(3)
 
-  members       AccountMember[]
-  invitations   Invitation[]
-  apiKeys       ApiKey[]
+  members          AccountMember[]
+  invitations      Invitation[]
+  apiKeys          ApiKey[]
   webhookEndpoints WebhookEndpoint[]
+  contacts         Contact[]
+  tags             Tag[]
+  conversations    Conversation[]
+  whatsappConfigs  WhatsAppConfig[]
+  messageTemplates MessageTemplate[]
+  broadcasts       Broadcast[]
+
   @@map("accounts")
 }
 
 model AccountMember {
-  userId    String   @id @map("user_id") @db.VarChar(36)
-  accountId String   @map("account_id") @db.VarChar(36)
+  userId    String      @id @map("user_id") @db.VarChar(36)
+  accountId String      @map("account_id") @db.VarChar(36)
   role      AccountRole
-  createdAt DateTime @default(now()) @map("created_at") @db.DateTime(3)
+  createdAt DateTime    @default(now()) @map("created_at") @db.DateTime(3)
 
   user    User    @relation(fields: [userId], references: [id], onDelete: Cascade)
   account Account @relation(fields: [accountId], references: [id], onDelete: Cascade)
@@ -71,16 +79,16 @@ enum AccountRole {
 }
 
 model Invitation {
-  id             String    @id @default(uuid()) @db.VarChar(36)
-  accountId      String    @map("account_id") @db.VarChar(36)
-  tokenHash      String    @unique @map("token_hash") @db.VarChar(64)
-  role           AccountRole
-  createdByUserId String?  @map("created_by_user_id") @db.VarChar(36)
-  label          String?   @db.VarChar(255)
-  createdAt      DateTime  @default(now()) @map("created_at") @db.DateTime(3)
-  expiresAt      DateTime  @map("expires_at") @db.DateTime(3)
-  acceptedAt     DateTime? @map("accepted_at") @db.DateTime(3)
-  acceptedByUserId String? @map("accepted_by_user_id") @db.VarChar(36)
+  id               String      @id @default(uuid()) @db.VarChar(36)
+  accountId        String      @map("account_id") @db.VarChar(36)
+  tokenHash        String      @unique @map("token_hash") @db.VarChar(64)
+  role             AccountRole
+  createdByUserId  String?     @map("created_by_user_id") @db.VarChar(36)
+  label            String?     @db.VarChar(255)
+  createdAt        DateTime    @default(now()) @map("created_at") @db.DateTime(3)
+  expiresAt        DateTime    @map("expires_at") @db.DateTime(3)
+  acceptedAt       DateTime?   @map("accepted_at") @db.DateTime(3)
+  acceptedByUserId String?     @map("accepted_by_user_id") @db.VarChar(36)
 
   account Account @relation(fields: [accountId], references: [id], onDelete: Cascade)
 
@@ -89,17 +97,17 @@ model Invitation {
 }
 
 model ApiKey {
-  id         String   @id @default(uuid()) @db.VarChar(36)
-  accountId  String   @map("account_id") @db.VarChar(36)
-  createdBy  String?  @map("created_by") @db.VarChar(36)
-  name       String   @db.VarChar(255)
-  keyPrefix  String   @map("key_prefix") @db.VarChar(64)
-  keyHash    String   @unique @map("key_hash") @db.VarChar(64)
-  scopes     String   @default("[]") @db.VarChar(2048)
+  id         String    @id @default(uuid()) @db.VarChar(36)
+  accountId  String    @map("account_id") @db.VarChar(36)
+  createdBy  String?   @map("created_by") @db.VarChar(36)
+  name       String    @db.VarChar(255)
+  keyPrefix  String    @map("key_prefix") @db.VarChar(64)
+  keyHash    String    @unique @map("key_hash") @db.VarChar(64)
+  scopes     String    @default("[]") @db.VarChar(2048)
   lastUsedAt DateTime? @map("last_used_at") @db.DateTime(3)
   expiresAt  DateTime? @map("expires_at") @db.DateTime(3)
   revokedAt  DateTime? @map("revoked_at") @db.DateTime(3)
-  createdAt  DateTime @default(now()) @map("created_at") @db.DateTime(3)
+  createdAt  DateTime  @default(now()) @map("created_at") @db.DateTime(3)
 
   account Account @relation(fields: [accountId], references: [id], onDelete: Cascade)
 
@@ -121,19 +129,309 @@ model FileRecord {
 }
 
 model WebhookEndpoint {
-  id           String    @id @default(uuid()) @db.VarChar(36)
-  accountId    String    @map("account_id") @db.VarChar(36)
-  createdBy    String?   @map("created_by") @db.VarChar(36)
-  url          String    @db.VarChar(512)
-  secret       String    @db.Text
-  events       String    @default("[]") @db.VarChar(2048)
-  isActive     Boolean   @default(true) @map("is_active")
+  id             String    @id @default(uuid()) @db.VarChar(36)
+  accountId      String    @map("account_id") @db.VarChar(36)
+  createdBy      String?   @map("created_by") @db.VarChar(36)
+  url            String    @db.VarChar(512)
+  secret         String    @db.Text
+  events         String    @default("[]") @db.VarChar(2048)
+  isActive       Boolean   @default(true) @map("is_active")
   lastDeliveryAt DateTime? @map("last_delivery_at") @db.DateTime(3)
-  failureCount Int       @default(0) @map("failure_count")
-  createdAt    DateTime  @default(now()) @map("created_at") @db.DateTime(3)
+  failureCount   Int       @default(0) @map("failure_count")
+  createdAt      DateTime  @default(now()) @map("created_at") @db.DateTime(3)
 
   account Account @relation(fields: [accountId], references: [id], onDelete: Cascade)
 
   @@index([accountId])
   @@map("webhook_endpoints")
+}
+
+// ============================================================
+// CRM domain models — ported from the Supabase schema
+// (supabase/migrations/*). snake_case columns via @@map.
+// ============================================================
+
+model Contact {
+  id              String   @id @default(uuid()) @db.VarChar(36)
+  accountId       String   @map("account_id") @db.VarChar(36)
+  userId          String   @map("user_id") @db.VarChar(36)
+  phone           String   @db.VarChar(32)
+  phoneNormalized String?  @map("phone_normalized") @db.VarChar(32)
+  name            String?  @db.VarChar(255)
+  email           String?  @db.VarChar(255)
+  company         String?  @db.VarChar(255)
+  avatarUrl       String?  @map("avatar_url") @db.Text
+  createdAt       DateTime @default(now()) @map("created_at") @db.DateTime(3)
+  updatedAt       DateTime @updatedAt @map("updated_at") @db.DateTime(3)
+
+  account       Account              @relation(fields: [accountId], references: [id], onDelete: Cascade)
+  conversations Conversation[]
+  contactTags   ContactTag[]         @relation("ContactTagContact")
+  recipients    BroadcastRecipient[]
+
+  @@unique([accountId, phoneNormalized])
+  @@index([accountId])
+  @@index([phone])
+  @@map("contacts")
+}
+
+model Tag {
+  id        String   @id @default(uuid()) @db.VarChar(36)
+  accountId String   @map("account_id") @db.VarChar(36)
+  userId    String   @map("user_id") @db.VarChar(36)
+  name      String   @db.VarChar(255)
+  color     String   @default("#3b82f6") @db.VarChar(16)
+  createdAt DateTime @default(now()) @map("created_at") @db.DateTime(3)
+
+  account     Account      @relation(fields: [accountId], references: [id], onDelete: Cascade)
+  contactTags ContactTag[] @relation("ContactTagTag")
+
+  @@index([accountId])
+  @@map("tags")
+}
+
+model ContactTag {
+  id        String   @id @default(uuid()) @db.VarChar(36)
+  contactId String   @map("contact_id") @db.VarChar(36)
+  tagId     String   @map("tag_id") @db.VarChar(36)
+  createdAt DateTime @default(now()) @map("created_at") @db.DateTime(3)
+
+  contact Contact @relation("ContactTagContact", fields: [contactId], references: [id], onDelete: Cascade)
+  tag     Tag     @relation("ContactTagTag", fields: [tagId], references: [id], onDelete: Cascade)
+
+  @@unique([contactId, tagId])
+  @@index([contactId])
+  @@index([tagId])
+  @@map("contact_tags")
+}
+
+model Conversation {
+  id              String             @id @default(uuid()) @db.VarChar(36)
+  accountId       String             @map("account_id") @db.VarChar(36)
+  userId          String             @map("user_id") @db.VarChar(36)
+  contactId       String             @map("contact_id") @db.VarChar(36)
+  status          ConversationStatus @default(open)
+  assignedAgentId String?            @map("assigned_agent_id") @db.VarChar(36)
+  lastMessageText String?            @map("last_message_text") @db.Text
+  lastMessageAt   DateTime?          @map("last_message_at") @db.DateTime(3)
+  unreadCount     Int                @default(0) @map("unread_count")
+  createdAt       DateTime           @default(now()) @map("created_at") @db.DateTime(3)
+  updatedAt       DateTime           @updatedAt @map("updated_at") @db.DateTime(3)
+
+  account  Account   @relation(fields: [accountId], references: [id], onDelete: Cascade)
+  contact  Contact   @relation(fields: [contactId], references: [id], onDelete: Cascade)
+  messages Message[]
+
+  @@unique([accountId, contactId])
+  @@index([contactId])
+  @@map("conversations")
+}
+
+model Message {
+  id                 String        @id @default(uuid()) @db.VarChar(36)
+  conversationId     String        @map("conversation_id") @db.VarChar(36)
+  senderType         SenderType    @map("sender_type")
+  senderId           String?       @map("sender_id") @db.VarChar(36)
+  contentType        ContentType   @default(text) @map("content_type")
+  contentText        String?       @map("content_text") @db.Text
+  mediaUrl           String?       @map("media_url") @db.Text
+  templateName       String?       @map("template_name") @db.VarChar(255)
+  messageId          String?       @map("message_id") @db.VarChar(255)
+  status             MessageStatus @default(sent)
+  replyToMessageId   String?       @map("reply_to_message_id") @db.VarChar(36)
+  interactiveReplyId String?       @map("interactive_reply_id") @db.VarChar(255)
+  interactivePayload Json?         @map("interactive_payload")
+  aiGenerated        Boolean       @default(false) @map("ai_generated")
+  createdAt          DateTime      @default(now()) @map("created_at") @db.DateTime(3)
+
+  conversation Conversation @relation(fields: [conversationId], references: [id], onDelete: Cascade)
+
+  @@unique([conversationId, messageId])
+  @@index([messageId])
+  @@index([replyToMessageId])
+  @@map("messages")
+}
+
+model WhatsAppConfig {
+  id                    String               @id @default(uuid()) @db.VarChar(36)
+  accountId             String               @unique @map("account_id") @db.VarChar(36)
+  userId                String               @map("user_id") @db.VarChar(36)
+  phoneNumberId         String               @unique @map("phone_number_id") @db.VarChar(64)
+  wabaId                String?              @map("waba_id") @db.VarChar(64)
+  accessToken           String               @map("access_token") @db.Text
+  verifyToken           String?              @map("verify_token") @db.Text
+  status                WhatsAppConfigStatus @default(disconnected)
+  connectedAt           DateTime?            @map("connected_at") @db.DateTime(3)
+  registeredAt          DateTime?            @map("registered_at") @db.DateTime(3)
+  subscribedAppsAt      DateTime?            @map("subscribed_apps_at") @db.DateTime(3)
+  lastRegistrationError String?              @map("last_registration_error") @db.Text
+  createdAt             DateTime             @default(now()) @map("created_at") @db.DateTime(3)
+  updatedAt             DateTime             @updatedAt @map("updated_at") @db.DateTime(3)
+
+  account Account @relation(fields: [accountId], references: [id], onDelete: Cascade)
+
+  @@map("whatsapp_config")
+}
+
+model MessageTemplate {
+  id              String                  @id @default(uuid()) @db.VarChar(36)
+  accountId       String                  @map("account_id") @db.VarChar(36)
+  userId          String                  @map("user_id") @db.VarChar(36)
+  name            String                  @db.VarChar(255)
+  category        MessageTemplateCategory @default(Marketing)
+  language        String                  @default("en_US") @db.VarChar(16)
+  headerType      TemplateHeaderType?     @map("header_type")
+  headerContent   String?                 @map("header_content") @db.Text
+  bodyText        String                  @map("body_text") @db.Text
+  footerText      String?                 @map("footer_text") @db.Text
+  buttons         Json?                   @map("buttons")
+  sampleValues    Json?                   @map("sample_values")
+  metaTemplateId  String?                 @map("meta_template_id") @db.VarChar(255)
+  rejectionReason String?                 @map("rejection_reason") @db.Text
+  qualityScore    TemplateQualityScore?   @map("quality_score")
+  headerHandle    String?                 @map("header_handle") @db.VarChar(512)
+  headerMediaUrl  String?                 @map("header_media_url") @db.Text
+  submissionError String?                 @map("submission_error") @db.Text
+  lastSubmittedAt DateTime?               @map("last_submitted_at") @db.DateTime(3)
+  status          MessageTemplateStatus   @default(DRAFT)
+  createdAt       DateTime                @default(now()) @map("created_at") @db.DateTime(3)
+  updatedAt       DateTime                @updatedAt @map("updated_at") @db.DateTime(3)
+
+  account Account @relation(fields: [accountId], references: [id], onDelete: Cascade)
+
+  @@unique([userId, name, language])
+  @@index([accountId])
+  @@index([metaTemplateId])
+  @@map("message_templates")
+}
+
+model Broadcast {
+  id                String          @id @default(uuid()) @db.VarChar(36)
+  accountId         String          @map("account_id") @db.VarChar(36)
+  userId            String          @map("user_id") @db.VarChar(36)
+  name              String          @db.VarChar(255)
+  templateName      String          @map("template_name") @db.VarChar(255)
+  templateLanguage  String          @default("en_US") @map("template_language") @db.VarChar(16)
+  templateVariables Json?           @map("template_variables")
+  audienceFilter    Json?           @map("audience_filter")
+  scheduledAt       DateTime?       @map("scheduled_at") @db.DateTime(3)
+  status            BroadcastStatus @default(draft)
+  totalRecipients   Int             @default(0) @map("total_recipients")
+  sentCount         Int             @default(0) @map("sent_count")
+  deliveredCount    Int             @default(0) @map("delivered_count")
+  readCount         Int             @default(0) @map("read_count")
+  repliedCount      Int             @default(0) @map("replied_count")
+  failedCount       Int             @default(0) @map("failed_count")
+  createdAt         DateTime        @default(now()) @map("created_at") @db.DateTime(3)
+  updatedAt         DateTime        @updatedAt @map("updated_at") @db.DateTime(3)
+
+  account    Account              @relation(fields: [accountId], references: [id], onDelete: Cascade)
+  recipients BroadcastRecipient[]
+
+  @@index([accountId])
+  @@map("broadcasts")
+}
+
+model BroadcastRecipient {
+  id                String                   @id @default(uuid()) @db.VarChar(36)
+  broadcastId       String                   @map("broadcast_id") @db.VarChar(36)
+  contactId         String?                  @map("contact_id") @db.VarChar(36)
+  status            BroadcastRecipientStatus @default(pending)
+  sentAt            DateTime?                @map("sent_at") @db.DateTime(3)
+  deliveredAt       DateTime?                @map("delivered_at") @db.DateTime(3)
+  readAt            DateTime?                @map("read_at") @db.DateTime(3)
+  repliedAt         DateTime?                @map("replied_at") @db.DateTime(3)
+  errorMessage      String?                  @map("error_message") @db.Text
+  whatsappMessageId String?                  @unique @map("whatsapp_message_id") @db.VarChar(255)
+  createdAt         DateTime                 @default(now()) @map("created_at") @db.DateTime(3)
+
+  broadcast Broadcast @relation(fields: [broadcastId], references: [id], onDelete: Cascade)
+  contact   Contact?  @relation(fields: [contactId], references: [id], onDelete: SetNull)
+
+  @@index([broadcastId, status])
+  @@index([contactId])
+  @@map("broadcast_recipients")
+}
+
+enum SenderType {
+  customer
+  agent
+  bot
+}
+
+enum ContentType {
+  text
+  image
+  document
+  audio
+  video
+  location
+  template
+  interactive
+}
+
+enum MessageStatus {
+  sending
+  sent
+  delivered
+  read
+  failed
+}
+
+enum ConversationStatus {
+  open
+  pending
+  closed
+}
+
+enum WhatsAppConfigStatus {
+  connected
+  disconnected
+}
+
+enum TemplateHeaderType {
+  text
+  image
+  video
+  document
+}
+
+enum MessageTemplateCategory {
+  Marketing
+  Utility
+  Authentication
+}
+
+enum TemplateQualityScore {
+  GREEN
+  YELLOW
+  RED
+}
+
+enum MessageTemplateStatus {
+  DRAFT
+  PENDING
+  APPROVED
+  REJECTED
+  PAUSED
+  DISABLED
+  IN_APPEAL
+  PENDING_DELETION
+}
+
+enum BroadcastStatus {
+  draft
+  scheduled
+  sending
+  sent
+  failed
+}
+
+enum BroadcastRecipientStatus {
+  pending
+  sent
+  delivered
+  read
+  replied
+  failed
 }
