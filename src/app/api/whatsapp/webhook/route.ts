@@ -228,10 +228,10 @@ async function processWebhook(body: { entry?: WhatsAppWebhookEntry[] }) {
       // dedicated handler. Skip the messaging branches below so we
       // don't try to read message-shaped fields off a template event.
       if (isTemplateWebhookField(change.field)) {
-        await handleTemplateWebhookChange(
-          { field: change.field, value: change.value as unknown },
-          supabaseAdmin(),
-        )
+        await handleTemplateWebhookChange({
+          field: change.field,
+          value: change.value as unknown,
+        })
         continue
       }
 
@@ -426,7 +426,6 @@ async function handleStatusUpdate(status: {
     const accountId = conv?.account_id
     if (accountId) {
       await dispatchWebhookEvent(
-        supabaseAdmin(),
         accountId,
         'message.status_updated',
         {
@@ -599,7 +598,7 @@ async function processMessage(
   // a reaction still fires the event, and a subscriber always sees the
   // thread open before its first message.received.
   if (convResult.created) {
-    await dispatchWebhookEvent(supabaseAdmin(), accountId, 'conversation.created', {
+    await dispatchWebhookEvent(accountId, 'conversation.created', {
       conversation_id: conversation.id,
       contact_id: contactRecord.id,
     })
@@ -738,7 +737,7 @@ async function processMessage(
   // separate conditional statement rather than a `status` field on the
   // update above so the write can be gated on the row's CURRENT status in
   // SQL — see the helper for why that matters.
-  await reopenClosedConversation(supabaseAdmin(), conversation)
+  await reopenClosedConversation(conversation)
 
   // If this contact was a recent broadcast recipient, flag the reply
   // so the broadcast's `replied_count` advances (via the aggregate
@@ -863,7 +862,7 @@ async function processMessage(
   // when the account has no matching endpoint and never throws.
   // (conversation.created is emitted earlier, right after the thread is
   // opened.)
-  await dispatchWebhookEvent(supabaseAdmin(), accountId, 'message.received', {
+  await dispatchWebhookEvent(accountId, 'message.received', {
     conversation_id: conversation.id,
     contact_id: contactRecord.id,
     whatsapp_message_id: message.id,
