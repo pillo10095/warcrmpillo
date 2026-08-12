@@ -21,14 +21,15 @@
  *
  * ─── Multi-tenant note ────────────────────────────────────────────
  * `meta_template_id` is globally unique per WABA — the lookup doesn't
- * filter by user_id. If two wacrm tenants somehow ended up with the
+ * filter by account. If two wacrm tenants somehow ended up with the
  * same id (impossible in practice, but a theoretical race during
  * cross-tenant moves), the handler updates both rows and logs a
  * warning so operators can investigate.
  */
 
-import type { SupabaseQueryBuilder } from '@/lib/supabase/query-builder'
+import type { MessageTemplateStatus, TemplateQualityScore } from '@prisma/client'
 import { normalizeStatus } from './template-status-normalize'
+import { prisma } from '@/lib/db/prisma'
 
 const TEMPLATE_WEBHOOK_FIELDS = new Set([
   'message_template_status_update',
@@ -75,35 +76,22 @@ export interface TemplateWebhookChange {
  */
 export async function handleTemplateWebhookChange(
   change: TemplateWebhookChange,
-  // SupabaseQueryBuilder typed loosely — the webhook route lazy-initialises
-  // the admin client and exposes it as `any`. Type as the generic
-  // SupabaseQueryBuilder here so this module is testable in isolation.
-  supabase: SupabaseQueryBuilder,
 ): Promise<void> {
   switch (change.field) {
     case 'message_template_status_update':
-      await handleStatusUpdate(
-        change.value as TemplateStatusUpdateValue,
-        supabase,
-      )
+      await handleStatusUpdate(change.value as TemplateStatusUpdateValue)
       return
     case 'message_template_quality_update':
-      await handleQualityUpdate(
-        change.value as TemplateQualityUpdateValue,
-        supabase,
-      )
+      await handleQualityUpdate(change.value as TemplateQualityUpdateValue)
       return
     case 'message_template_components_update':
-      handleComponentsUpdate(
-        change.value as TemplateComponentsUpdateValue,
-      )
+      handleComponentsUpdate(change.value as TemplateComponentsUpdateValue)
       return
   }
 }
 
 async function handleStatusUpdate(
   value: TemplateStatusUpdateValue,
-  supabase: SupabaseQueryBuilder,
 ): Promise<void> {
   const metaTemplateId =
     value.message_template_id !== undefined
@@ -117,34 +105,17 @@ async function handleStatusUpdate(
     return
   }
 
-  const status = normalizeStatus(value.event)
+  const status = normalizeStatus(value.event) as MessageTemplateStatus
 
-  // Persist the rejection reason on REJECTED — that's the only event
-  // where Meta sends a human-readable explanation. Clear it on any
-  // other status flip so the UI doesn't show a stale REJECTED banner
-  // after Meta re-approves a resubmitted template.
-  const update: Record<string, unknown> = {
-    status,
-    rejection_reason:
-      status === 'REJECTED' ? value.reason ?? 'Rejected by Meta' : null,
-    submission_error: null,
-  }
+  // Match every stored row for this meta_template_id so the caller can
+  // distinguish "unknown template" (0 matches) from a cross-tenant
+  // collision (>1), then update them in one statement.
+  const matched = await prisma.messageTemplate.findMany({
+    where: { metaTemplateId },
+    select: { id: true },
+  })
 
-  const { data, error } = await supabase
-    .from('message_templates')
-    .update(update)
-    .eq('meta_template_id', metaTemplateId)
-    .select('id')
-
-  if (error) {
-    console.error(
-      '[template-webhook] status update failed for meta_template_id',
-      metaTemplateId,
-      error.message,
-    )
-    return
-  }
-  if (!data || data.length === 0) {
+  if (matched.length === 0) {
     console.warn(
       '[template-webhook] status update received for unknown template:',
       metaTemplateId,
@@ -152,16 +123,29 @@ async function handleStatusUpdate(
     )
     return
   }
-  if (data.length > 1) {
+  if (matched.length > 1) {
     console.warn(
-      `[template-webhook] status update matched ${data.length} rows for meta_template_id ${metaTemplateId} — investigate.`,
+      `[template-webhook] status update matched ${matched.length} rows for meta_template_id ${metaTemplateId} — investigate.`,
     )
   }
+
+  // Persist the rejection reason on REJECTED — that's the only event
+  // where Meta sends a human-readable explanation. Clear it on any
+  // other status flip so the UI doesn't show a stale REJECTED banner
+  // after Meta re-approves a resubmitted template.
+  await prisma.messageTemplate.updateMany({
+    where: { id: { in: matched.map((row) => row.id) } },
+    data: {
+      status,
+      rejectionReason:
+        status === 'REJECTED' ? value.reason ?? 'Rejected by Meta' : null,
+      submissionError: null,
+    },
+  })
 }
 
 async function handleQualityUpdate(
   value: TemplateQualityUpdateValue,
-  supabase: SupabaseQueryBuilder,
 ): Promise<void> {
   const metaTemplateId =
     value.message_template_id !== undefined
@@ -178,19 +162,19 @@ async function handleQualityUpdate(
   const raw = value.new_quality_score
   const score =
     raw && ['GREEN', 'YELLOW', 'RED'].includes(raw.toUpperCase())
-      ? (raw.toUpperCase() as 'GREEN' | 'YELLOW' | 'RED')
+      ? (raw.toUpperCase() as TemplateQualityScore)
       : null
 
-  const { error } = await supabase
-    .from('message_templates')
-    .update({ quality_score: score })
-    .eq('meta_template_id', metaTemplateId)
+  const result = await prisma.messageTemplate.updateMany({
+    where: { metaTemplateId },
+    data: { qualityScore: score },
+  })
 
-  if (error) {
+  if (result.count === 0) {
     console.error(
       '[template-webhook] quality update failed for meta_template_id',
       metaTemplateId,
-      error.message,
+      `no row matched (${result.count} updated)`,
     )
   }
 }
