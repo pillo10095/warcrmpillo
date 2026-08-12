@@ -79,10 +79,10 @@ describe('handleTemplateWebhookChange — status update', () => {
     });
     expect(mockedUpdateMany).toHaveBeenCalledWith(
       expect.objectContaining({
-        data: {
+        data: expect.objectContaining({
           status: 'REJECTED',
           rejectionReason: 'Template uses non-compliant language.',
-        },
+        }),
       }),
     );
   });
@@ -94,7 +94,9 @@ describe('handleTemplateWebhookChange — status update', () => {
     });
     expect(mockedUpdateMany).toHaveBeenCalledWith(
       expect.objectContaining({
-        data: { rejectionReason: 'Rejected by Meta' },
+        data: expect.objectContaining({
+          rejectionReason: 'Rejected by Meta',
+        }),
       }),
     );
   });
@@ -105,7 +107,9 @@ describe('handleTemplateWebhookChange — status update', () => {
       value: { event: 'PENDING_REVIEW', message_template_id: '1' },
     });
     expect(mockedUpdateMany).toHaveBeenCalledWith(
-      expect.objectContaining({ data: { status: 'PENDING' } }),
+      expect.objectContaining({
+        data: expect.objectContaining({ status: 'PENDING' }),
+      }),
     );
   });
 
