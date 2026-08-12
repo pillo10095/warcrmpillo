@@ -20,7 +20,7 @@
 
 import { randomUUID } from 'node:crypto';
 
-import type { SupabaseQueryBuilder } from '@/lib/supabase/query-builder';
+import { prisma } from '@/lib/db/prisma';
 
 import { decrypt } from '@/lib/whatsapp/encryption';
 import { buildSignatureHeader } from '@/lib/webhooks/sign';
@@ -44,20 +44,33 @@ interface EndpointRow {
  * subscribed to it. Never throws.
  */
 export async function dispatchWebhookEvent(
-  db: SupabaseQueryBuilder,
   accountId: string,
   event: WebhookEvent,
   data: unknown
 ): Promise<void> {
   try {
-    const { data: rows, error } = await db
-      .from('webhook_endpoints')
-      .select('id, url, secret')
-      .eq('account_id', accountId)
-      .eq('is_active', true)
-      .contains('events', [event]);
+    const rows = await prisma.webhookEndpoint.findMany({
+      where: { accountId, isActive: true },
+      select: {
+        id: true,
+        url: true,
+        secret: true,
+        events: true,
+      },
+    });
 
-    if (error || !rows || rows.length === 0) return;
+    const subscribed = rows.filter((row) => {
+      try {
+        const events: unknown = JSON.parse(row.events);
+        return (
+          Array.isArray(events) &&
+          events.some((e) => String(e) === event)
+        );
+      } catch {
+        return false;
+      }
+    });
+    if (subscribed.length === 0) return;
 
     // Sign the exact bytes we send so a receiver can recompute the
     // HMAC over the raw request body. `id` is a per-delivery uuid the
@@ -73,8 +86,8 @@ export async function dispatchWebhookEvent(
     const tsSeconds = Math.floor(Date.now() / 1000);
 
     await Promise.allSettled(
-      (rows as EndpointRow[]).map((row) =>
-        deliverOne(db, row, event, payload, tsSeconds)
+      (subscribed as EndpointRow[]).map((row) =>
+        deliverOne(row, event, payload, tsSeconds)
       )
     );
   } catch (err) {
@@ -84,7 +97,6 @@ export async function dispatchWebhookEvent(
 }
 
 async function deliverOne(
-  db: SupabaseQueryBuilder,
   row: EndpointRow,
   event: WebhookEvent,
   payload: string,
@@ -95,7 +107,7 @@ async function deliverOne(
   // misconfigured internal URL surfaces and eventually auto-disables.
   if (!(await isDeliverableUrl(row.url))) {
     console.warn('[webhooks] refusing non-public delivery target for', row.id);
-    await recordFailure(db, row);
+    await recordFailure(row);
     return;
   }
 
@@ -106,7 +118,7 @@ async function deliverOne(
     // A row whose secret can't be decrypted can never produce a valid
     // signature — count it as a failure so it eventually auto-disables.
     console.error('[webhooks] secret decrypt failed for', row.id, err);
-    await recordFailure(db, row);
+    await recordFailure(row);
     return;
   }
 
@@ -129,30 +141,35 @@ async function deliverOne(
     if (!res.ok) throw new Error(`endpoint responded ${res.status}`);
 
     // Success: clear the failure streak.
-    await db
-      .from('webhook_endpoints')
-      .update({ failure_count: 0, last_delivery_at: new Date().toISOString() })
-      .eq('id', row.id);
+    await prisma.webhookEndpoint.update({
+      where: { id: row.id },
+      data: { failureCount: 0, lastDeliveryAt: new Date() },
+    });
   } catch (err) {
     console.warn(
       `[webhooks] delivery to ${row.id} failed:`,
       err instanceof Error ? err.message : err
     );
-    await recordFailure(db, row);
+    await recordFailure(row);
   }
 }
 
-async function recordFailure(db: SupabaseQueryBuilder, row: EndpointRow): Promise<void> {
-  // Atomic increment (+ auto-disable at the threshold) via a SQL
-  // function — a read-modify-write here would lose increments when two
-  // deliveries to the same endpoint run concurrently (e.g.
-  // conversation.created + message.received for one inbound message),
-  // so a dead endpoint might never reach the disable threshold.
-  const { error } = await db.rpc('record_webhook_failure', {
-    endpoint_id: row.id,
-    max_failures: MAX_CONSECUTIVE_FAILURES,
+async function recordFailure(row: EndpointRow): Promise<void> {
+  // Atomic increment + auto-disable at the threshold. Prisma's
+  // `increment` does the update in a single statement, so two
+  // deliveries to the same endpoint running concurrently (e.g.
+  // conversation.created + message.received for one inbound message)
+  // can't lose increments; a dead endpoint reliably reaches the
+  // disable threshold.
+  const updated = await prisma.webhookEndpoint.update({
+    where: { id: row.id },
+    data: { failureCount: { increment: 1 } },
+    select: { failureCount: true },
   });
-  if (error) {
-    console.error('[webhooks] record_webhook_failure failed for', row.id, error);
+  if (updated.failureCount >= MAX_CONSECUTIVE_FAILURES) {
+    await prisma.webhookEndpoint.update({
+      where: { id: row.id },
+      data: { isActive: false },
+    });
   }
 }
