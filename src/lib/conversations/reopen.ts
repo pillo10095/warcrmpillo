@@ -1,4 +1,4 @@
-import type { SupabaseQueryBuilder } from '@/lib/supabase/query-builder'
+import { prisma } from '@/lib/db/prisma'
 
 /**
  * Re-open a closed conversation because the customer wrote again
@@ -16,30 +16,31 @@ import type { SupabaseQueryBuilder } from '@/lib/supabase/query-builder'
  * without standing up the whole route, and so any future inbound path
  * gets the same behaviour for free.
  */
-export async function reopenClosedConversation(
-  db: SupabaseQueryBuilder,
-  conversation: { id: string; status?: string | null },
-): Promise<boolean> {
+export async function reopenClosedConversation(conversation: {
+  id: string
+  status?: string | null
+}): Promise<boolean> {
   // Nothing to do for open/pending threads, which is the common case —
   // skipping the round trip keeps inbound processing as cheap as it was.
   if (conversation.status !== 'closed') return false
 
-  const { error } = await db
-    .from('conversations')
-    .update({ status: 'open', updated_at: new Date().toISOString() })
-    .eq('id', conversation.id)
-    // Re-checked in SQL, not just in the `if` above: the caller's row was
-    // read earlier in the request, so two concurrent inbound deliveries
-    // both holding a stale `status: 'closed'` must not be able to write
-    // 'open' back over an agent who re-closed the thread in between.
-    .eq('status', 'closed')
-
-  if (error) {
+  try {
+    const result = await prisma.conversation.updateMany({
+      where: {
+        id: conversation.id,
+        // Re-checked in SQL, not just in the `if` above: the caller's row was
+        // read earlier in the request, so two concurrent inbound deliveries
+        // both holding a stale `status: 'closed'` must not be able to write
+        // 'open' back over an agent who re-closed the thread in between.
+        status: 'closed',
+      },
+      data: { status: 'open', updatedAt: new Date() },
+    })
+    return result.count > 0
+  } catch (error) {
     // Best-effort, same as the conversation update this follows: a failed
     // re-open must not abort inbound processing (and make Meta redeliver).
     console.error('Error re-opening conversation:', error)
     return false
   }
-
-  return true
 }
