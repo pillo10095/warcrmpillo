@@ -361,76 +361,56 @@ export function MessageThread({
     };
   }, [conversationId, resyncToken]);
 
-  // Reactions realtime subscription per conversation. Subscribing here
-  // (not at the page level) keeps the channel scoped to the visible
-  // conversation and avoids cross-conversation chatter on a busy inbox.
+  // Reactions polling per conversation. Fetches every 5 seconds to stay
+  // in sync instead of using Supabase Realtime.
   useEffect(() => {
     if (!conversationId) return;
-    const supabase = createClient();
 
-    const channel = supabase
-      .channel(`reactions:${conversationId}`)
-      .on(
-        "postgres_changes",
-        {
-          event: "INSERT",
-          schema: "public",
-          table: "message_reactions",
-          filter: `conversation_id=eq.${conversationId}`,
-        },
-        (payload) => {
-          const row = payload.new as MessageReaction;
-          setReactions((prev) => {
-            if (prev.some((r) => r.id === row.id)) return prev;
-            // Swap any matching optimistic temp row for the real one so
-            // the pill doesn't double up after a successful POST.
-            const tempIdx = prev.findIndex(
+    let cancelled = false;
+
+    const fetchReactions = async () => {
+      try {
+        const res = await fetch(
+          `/api/data/message_reactions?select=*&conversation_id=eq.${conversationId}`
+        );
+        if (!res.ok || cancelled) return;
+        const data = (await res.json()) as MessageReaction[];
+        if (cancelled) return;
+
+        setReactions((prev) => {
+          // Merge: keep optimistic temp rows, replace with real rows when present
+          const realIds = new Set(data.map((r) => r.id));
+          const temps = prev.filter((r) => r.id.startsWith("temp-") && !realIds.has(r.id));
+          // Deduplicate by id
+          const map = new Map<string, MessageReaction>();
+          for (const r of data) map.set(r.id, r);
+          for (const t of temps) {
+            // Replace temp with real if matching message_id + actor
+            const match = data.find(
               (r) =>
-                r.id.startsWith("temp-") &&
-                r.message_id === row.message_id &&
-                r.actor_type === row.actor_type &&
-                r.actor_id === row.actor_id,
+                r.message_id === t.message_id &&
+                r.actor_type === t.actor_type &&
+                r.actor_id === t.actor_id,
             );
-            if (tempIdx >= 0) {
-              const copy = prev.slice();
-              copy[tempIdx] = row;
-              return copy;
+            if (match) {
+              map.set(match.id, match);
+            } else {
+              map.set(t.id, t);
             }
-            return [...prev, row];
-          });
-        },
-      )
-      .on(
-        "postgres_changes",
-        {
-          event: "UPDATE",
-          schema: "public",
-          table: "message_reactions",
-          filter: `conversation_id=eq.${conversationId}`,
-        },
-        (payload) => {
-          const row = payload.new as MessageReaction;
-          setReactions((prev) => prev.map((r) => (r.id === row.id ? row : r)));
-        },
-      )
-      .on(
-        "postgres_changes",
-        {
-          event: "DELETE",
-          schema: "public",
-          table: "message_reactions",
-          filter: `conversation_id=eq.${conversationId}`,
-        },
-        (payload) => {
-          const old = payload.old as Partial<MessageReaction>;
-          if (!old?.id) return;
-          setReactions((prev) => prev.filter((r) => r.id !== old.id));
-        },
-      )
-      .subscribe();
+          }
+          return Array.from(map.values());
+        });
+      } catch {
+        // Network error — skip this tick.
+      }
+    };
+
+    fetchReactions();
+    const id = setInterval(fetchReactions, 5_000);
 
     return () => {
-      supabase.removeChannel(channel);
+      cancelled = true;
+      clearInterval(id);
     };
   }, [conversationId]);
 

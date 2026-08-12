@@ -16,7 +16,7 @@
 // for API broadcasts exactly as it does for dashboard ones.
 // ============================================================
 
-import type { SupabaseClient } from '@supabase/supabase-js';
+import type { SupabaseQueryBuilder } from '@/lib/supabase/query-builder';
 
 import { sendTemplateMessage } from '@/lib/whatsapp/meta-api';
 import { decrypt } from '@/lib/whatsapp/encryption';
@@ -83,7 +83,7 @@ const MAX_RECIPIENTS = 1000;
  * template / a DB failure — nothing is sent in this phase.
  */
 export async function createBroadcast(
-  db: SupabaseClient,
+  db: SupabaseQueryBuilder,
   accountId: string,
   auditUserId: string,
   params: CreateBroadcastParams
@@ -255,7 +255,7 @@ export async function createBroadcast(
  * race and clobber the trigger-maintained counts.
  */
 export async function deliverBroadcast(
-  db: SupabaseClient,
+  db: SupabaseQueryBuilder,
   plan: BroadcastPlan
 ): Promise<void> {
   let sentCount = 0;

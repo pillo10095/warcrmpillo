@@ -1,0 +1,659 @@
+# Review package: 742b8b7..cb3dd49
+
+## Commits
+cb3dd49 refactor(whatsapp): migrate resolve-conversation to Prisma
+
+## Files changed
+ src/lib/whatsapp/resolve-conversation.test.ts | 325 ++++++++++----------------
+ src/lib/whatsapp/resolve-conversation.ts      | 119 +++++-----
+ 2 files changed, 186 insertions(+), 258 deletions(-)
+
+## Diff
+diff --git a/src/lib/whatsapp/resolve-conversation.test.ts b/src/lib/whatsapp/resolve-conversation.test.ts
+index d14c4dd..b6e5803 100644
+--- a/src/lib/whatsapp/resolve-conversation.test.ts
++++ b/src/lib/whatsapp/resolve-conversation.test.ts
+@@ -1,257 +1,188 @@
+-import { describe, expect, it, vi } from 'vitest';
+-import type { SupabaseClient } from '@supabase/supabase-js';
++import { beforeEach, describe, expect, it, vi } from 'vitest';
+ 
+-import { resolveConversationByPhone } from './resolve-conversation';
+-import { SendMessageError } from './send-message';
+-
+-// Migration shim (Task B): the shared contact helpers are now
+-// Prisma-backed and ignore the passed client, but
+-// `resolveConversationByPhone` still drives its lookups through the
+-// scripted Supabase stub below. Keep these two stubs reproducing the
+-// pre-migration behavior until resolve-conversation itself migrates
+-// (Task C).
+-vi.mock('@/lib/contacts/dedupe', () => ({
+-  isUniqueViolation: (e: unknown) =>
+-    (e as { code?: string })?.code === '23505',
+-  findExistingContact: async (db: {
+-    from: (table: string) => {
+-      select: () => { eq: () => { like: () => Promise<{ data: ContactRow[] | null; error: null }> } };
+-      eq: () => { like: () => Promise<{ data: ContactRow[] | null; error: null }> };
+-      like: () => Promise<{ data: ContactRow[] | null; error: null }>;
+-    };
+-  }) => {
+-    const { data } = await db.from('contacts').select().eq().like();
+-    return (data?.[0] ?? null) as ContactRow | null;
++// Prisma mock ÔÇö mirrors the pattern in `send-message.test.ts`. The
++// shared helpers (`findExistingContact`, `resolveAuditUserId`) run for
++// REAL against this mocked client, so these tests exercise the actual
++// dedupe/audit-user logic, not a scripted stub.
++const mocks = vi.hoisted(() => ({
++  prisma: {
++    whatsAppConfig: { findFirst: vi.fn(), findUnique: vi.fn() },
++    contact: { findMany: vi.fn(), update: vi.fn(), create: vi.fn() },
++    conversation: { findFirst: vi.fn(), create: vi.fn() },
+   },
+ }));
+ 
+-vi.mock('@/lib/api/v1/contacts', () => {
+-  class ContactError extends Error {
+-    status: number;
+-    constructor(message: string, status: number) {
+-      super(message);
+-      this.name = 'ContactError';
+-      this.status = status;
+-    }
+-  }
+-  return {
+-    ContactError,
+-    resolveAuditUserId: async (db: {
+-      from: (table: string) => {
+-        select: () => { eq: () => { maybeSingle: () => Promise<{ data: { user_id?: string } | null; error: null }> } };
+-        eq: () => { maybeSingle: () => Promise<{ data: { user_id?: string } | null; error: null }> };
+-        maybeSingle: () => Promise<{ data: { user_id?: string } | null; error: null }>;
+-      };
+-    }) => {
+-      const { data } = await db.from('whatsapp_config').select().eq().maybeSingle();
+-      const owner = data?.user_id;
+-      if (!owner) throw new ContactError('Account owner could not be resolved', 500);
+-      return owner;
+-    },
+-  };
+-});
++vi.mock('@/lib/db/prisma', () => ({ prisma: mocks.prisma }));
+ 
+-// ------------------------------------------------------------
+-// Chainable Supabase stub, scripted per table. Terminal methods
+-// (like/maybeSingle/single) resolve to configured data; the builder
+-// itself is thenable so an awaited `update().eq()` resolves cleanly.
+-// ------------------------------------------------------------
+-type ContactRow = { id: string; phone: string; name?: string | null };
++import { resolveConversationByPhone } from './resolve-conversation';
++import { SendMessageError } from './send-message';
+ 
+-interface Script {
+-  config?: { user_id: string } | null; // whatsapp_config.maybeSingle
+-  contactCandidates?: ContactRow[]; // contacts .like (same every call)
+-  /** Per-call `.like` results ÔÇö overrides contactCandidates. Lets a
+-   *  test simulate "miss, then hit" for the unique-race path. */
+-  contactCandidatesByCall?: ContactRow[][];
+-  insertedContactId?: string; // contacts insert -> single
+-  insertContactError?: { code?: string } | null;
+-  /** Conversation lookup result (oldest-first `.order().limit(1)`).
+-   *  A single row or null; wrapped into a one-element array internally. */
+-  existingConversation?: { id: string } | null; // conversations select.limit(1)
+-  /** Per-call conversation lookup results ÔÇö overrides existingConversation.
+-   *  Lets a test simulate "miss, then hit" for the unique-race path. */
+-  existingConversationByCall?: (({ id: string } | null))[];
+-  insertedConversationId?: string; // conversations insert -> single
+-  insertConversationError?: { code?: string } | null;
+-}
++const ACCOUNT_ID = 'acct';
+ 
+-function makeDb(script: Script): SupabaseClient {
+-  let table = '';
+-  let mode: 'select' | 'insert' | 'update' = 'select';
+-  let likeCalls = 0;
+-  let convLookupCalls = 0;
++const CONTACT_ROW = { id: 'c1', phone: '14155550123', name: null };
++const CONFIG_ROW = { id: 'cfg-1' };
+ 
+-  const builder: Record<string, unknown> = {
+-    select: () => builder,
+-    insert: () => {
+-      mode = 'insert';
+-      return builder;
+-    },
+-    update: () => {
+-      mode = 'update';
+-      return builder;
+-    },
+-    eq: () => builder,
+-    order: () => builder,
+-    limit: () => {
+-      // Only the conversation lookup terminates on `.limit(1)`.
+-      if (table === 'conversations' && mode === 'select') {
+-        const row = script.existingConversationByCall
+-          ? (script.existingConversationByCall[convLookupCalls] ?? null)
+-          : (script.existingConversation ?? null);
+-        convLookupCalls++;
+-        return Promise.resolve({ data: row ? [row] : [], error: null });
+-      }
+-      return Promise.resolve({ data: [], error: null });
+-    },
+-    like: () => {
+-      const data = script.contactCandidatesByCall
+-        ? (script.contactCandidatesByCall[likeCalls] ?? [])
+-        : (script.contactCandidates ?? []);
+-      likeCalls++;
+-      return Promise.resolve({ data, error: null });
+-    },
+-    maybeSingle: () => {
+-      if (table === 'whatsapp_config')
+-        return Promise.resolve({ data: script.config ?? null, error: null });
+-      return Promise.resolve({ data: null, error: null });
+-    },
+-    single: () => {
+-      if (table === 'contacts' && mode === 'insert') {
+-        if (script.insertContactError)
+-          return Promise.resolve({
+-            data: null,
+-            error: script.insertContactError,
+-          });
+-        return Promise.resolve({
+-          data: { id: script.insertedContactId },
+-          error: null,
+-        });
+-      }
+-      if (table === 'conversations' && mode === 'insert') {
+-        if (script.insertConversationError)
+-          return Promise.resolve({
+-            data: null,
+-            error: script.insertConversationError,
+-          });
+-        return Promise.resolve({
+-          data: { id: script.insertedConversationId },
+-          error: null,
+-        });
+-      }
+-      return Promise.resolve({ data: null, error: null });
+-    },
+-    // Thenable: `await db.from().update().eq()` lands here.
+-    then: (resolve: (v: { data: null; error: null }) => void) =>
+-      resolve({ data: null, error: null }),
+-  };
++beforeEach(() => {
++  vi.clearAllMocks();
+ 
+-  return {
+-    from: (t: string) => {
+-      table = t;
+-      mode = 'select';
+-      return builder;
+-    },
+-  } as unknown as SupabaseClient;
+-}
++  // Config exists + the (real) resolveAuditUserId resolves the owner
++  // from the config row.
++  mocks.prisma.whatsAppConfig.findFirst.mockResolvedValue(CONFIG_ROW);
++  mocks.prisma.whatsAppConfig.findUnique.mockResolvedValue({
++    userId: 'owner-1',
++  });
++
++  // Defaults: no existing contact, no existing conversation.
++  mocks.prisma.contact.findMany.mockResolvedValue([]);
++  mocks.prisma.conversation.findFirst.mockResolvedValue(null);
++
++  mocks.prisma.contact.update.mockResolvedValue({});
++  mocks.prisma.contact.create.mockResolvedValue({ id: 'c2' });
++  mocks.prisma.conversation.create.mockResolvedValue({ id: 'cv2' });
++});
+ 
+ describe('resolveConversationByPhone', () => {
+   it('rejects an invalid phone before any DB call', async () => {
+-    const db = {
+-      from() {
+-        throw new Error('should not query');
+-      },
+-    } as unknown as SupabaseClient;
+     await expect(
+-      resolveConversationByPhone(db, 'acct', 'not-a-phone')
++      resolveConversationByPhone(undefined, ACCOUNT_ID, 'not-a-phone')
+     ).rejects.toBeInstanceOf(SendMessageError);
++    await expect(
++      resolveConversationByPhone(undefined, ACCOUNT_ID, 'not-a-phone')
++    ).rejects.toMatchObject({ code: 'bad_request', status: 400 });
++    expect(mocks.prisma.whatsAppConfig.findFirst).not.toHaveBeenCalled();
++    expect(mocks.prisma.contact.findMany).not.toHaveBeenCalled();
+   });
+ 
+-  it('fails with whatsapp_not_configured when no config owner exists', async () => {
+-    const db = makeDb({ config: null });
+-    await resolveConversationByPhone(db, 'acct', '+14155550123').catch(
+-      (e: SendMessageError) => {
+-        expect(e.code).toBe('whatsapp_not_configured');
+-        expect(e.status).toBe(400);
+-      }
+-    );
++  it('fails with whatsapp_not_configured when the account has no config', async () => {
++    mocks.prisma.whatsAppConfig.findFirst.mockResolvedValue(null);
+     await expect(
+-      resolveConversationByPhone(db, 'acct', '+14155550123')
+-    ).rejects.toBeInstanceOf(SendMessageError);
++      resolveConversationByPhone(undefined, ACCOUNT_ID, '+14155550123')
++    ).rejects.toMatchObject({ code: 'whatsapp_not_configured', status: 400 });
++    expect(mocks.prisma.whatsAppConfig.findUnique).not.toHaveBeenCalled();
++    expect(mocks.prisma.contact.findMany).not.toHaveBeenCalled();
+   });
+ 
+-  it('returns the existing contact + conversation without creating', async () => {
+-    const db = makeDb({
+-      config: { user_id: 'owner-1' },
+-      contactCandidates: [{ id: 'c1', phone: '14155550123' }],
+-      existingConversation: { id: 'cv1' },
++  it('creates the conversation when the contact exists but has none', async () => {
++    mocks.prisma.contact.findMany.mockResolvedValue([CONTACT_ROW]);
++    const res = await resolveConversationByPhone(
++      undefined,
++      ACCOUNT_ID,
++      '+14155550123'
++    );
++    expect(res).toEqual({
++      conversationId: 'cv2',
++      contactId: 'c1',
++      contactCreated: false,
+     });
++    expect(mocks.prisma.conversation.create).toHaveBeenCalledWith({
++      data: { accountId: ACCOUNT_ID, userId: 'owner-1', contactId: 'c1' },
++      select: { id: true },
++    });
++    expect(mocks.prisma.contact.create).not.toHaveBeenCalled();
++  });
++
++  it('returns the existing contact + conversation without creating', async () => {
++    mocks.prisma.contact.findMany.mockResolvedValue([CONTACT_ROW]);
++    mocks.prisma.conversation.findFirst.mockResolvedValue({ id: 'cv1' });
+     const res = await resolveConversationByPhone(
+-      db,
+-      'acct',
++      undefined,
++      ACCOUNT_ID,
+       '+1 (415) 555-0123'
+     );
+     expect(res).toEqual({
+       conversationId: 'cv1',
+       contactId: 'c1',
+       contactCreated: false,
+     });
++    expect(mocks.prisma.contact.create).not.toHaveBeenCalled();
++    expect(mocks.prisma.conversation.create).not.toHaveBeenCalled();
+   });
+ 
+-  it('creates contact + conversation when none exist', async () => {
+-    const db = makeDb({
+-      config: { user_id: 'owner-1' },
+-      contactCandidates: [],
+-      insertedContactId: 'c2',
+-      existingConversation: null,
+-      insertedConversationId: 'cv2',
++  it('updates the contact name when it differs from the stored one', async () => {
++    mocks.prisma.contact.findMany.mockResolvedValue([
++      { id: 'c1', phone: '14155550123', name: 'Old Name' },
++    ]);
++    mocks.prisma.conversation.findFirst.mockResolvedValue({ id: 'cv1' });
++    const res = await resolveConversationByPhone(
++      undefined,
++      ACCOUNT_ID,
++      '+14155550123',
++      'New Name'
++    );
++    expect(res.contactId).toBe('c1');
++    expect(res.contactCreated).toBe(false);
++    expect(mocks.prisma.contact.update).toHaveBeenCalledWith({
++      where: { id: 'c1' },
++      data: { name: 'New Name', updatedAt: expect.any(Date) },
+     });
++  });
++
++  it('creates contact + conversation when none exist', async () => {
+     const res = await resolveConversationByPhone(
+-      db,
+-      'acct',
++      undefined,
++      ACCOUNT_ID,
+       '+14155550199',
+       'Jane'
+     );
+     expect(res).toEqual({
+       conversationId: 'cv2',
+       contactId: 'c2',
+       contactCreated: true,
+     });
++    expect(mocks.prisma.contact.create).toHaveBeenCalledWith({
++      data: {
++        accountId: ACCOUNT_ID,
++        userId: 'owner-1',
++        phone: '14155550199',
++        name: 'Jane',
++      },
++      select: { id: true },
++    });
++    expect(mocks.prisma.conversation.create).toHaveBeenCalledWith({
++      data: { accountId: ACCOUNT_ID, userId: 'owner-1', contactId: 'c2' },
++      select: { id: true },
++    });
+   });
+ 
+-  it('re-resolves an existing contact when the insert loses a unique race', async () => {
++  it('re-resolves the existing contact when the insert loses a unique race', async () => {
+     // First lookup misses (ÔåÆ we attempt an insert), the insert hits a
+-    // 23505 unique violation, and the post-race re-lookup now returns
++    // P2002 unique violation, and the post-race re-lookup now returns
+     // the row a concurrent writer created.
+-    const db = makeDb({
+-      config: { user_id: 'owner-1' },
+-      contactCandidatesByCall: [[], [{ id: 'c-raced', phone: '14155550123' }]],
+-      insertContactError: { code: '23505' },
+-      existingConversation: { id: 'cv-raced' },
+-    });
+-    const res = await resolveConversationByPhone(db, 'acct', '+14155550123');
++    mocks.prisma.contact.findMany
++      .mockResolvedValueOnce([])
++      .mockResolvedValueOnce([{ id: 'c-raced', phone: '14155550123' }]);
++    mocks.prisma.contact.create.mockRejectedValue({ code: 'P2002' });
++    mocks.prisma.conversation.findFirst.mockResolvedValue({ id: 'cv-raced' });
++    const res = await resolveConversationByPhone(
++      undefined,
++      ACCOUNT_ID,
++      '+14155550123'
++    );
+     expect(res.contactId).toBe('c-raced');
+     expect(res.contactCreated).toBe(false);
+     expect(res.conversationId).toBe('cv-raced');
+   });
+ 
+   it('re-resolves the conversation when the insert loses a unique race', async () => {
+     // Existing contact, conversation lookup misses first (ÔåÆ attempt an
+-    // insert), the insert hits a 23505 from a concurrent create, and the
++    // insert), the insert hits a P2002 from a concurrent create, and the
+     // post-race re-lookup returns the winning conversation ÔÇö no duplicate
+     // conversation is created (issue #363).
+-    const db = makeDb({
+-      config: { user_id: 'owner-1' },
+-      contactCandidates: [{ id: 'c1', phone: '14155550123' }],
+-      existingConversationByCall: [null, { id: 'cv-raced' }],
+-      insertConversationError: { code: '23505' },
+-    });
+-    const res = await resolveConversationByPhone(db, 'acct', '+14155550123');
++    mocks.prisma.contact.findMany.mockResolvedValue([CONTACT_ROW]);
++    mocks.prisma.conversation.findFirst
++      .mockResolvedValueOnce(null)
++      .mockResolvedValueOnce({ id: 'cv-raced' });
++    mocks.prisma.conversation.create.mockRejectedValue({ code: 'P2002' });
++    const res = await resolveConversationByPhone(
++      undefined,
++      ACCOUNT_ID,
++      '+14155550123'
++    );
+     expect(res).toEqual({
+       conversationId: 'cv-raced',
+       contactId: 'c1',
+       contactCreated: false,
+     });
++    expect(mocks.prisma.conversation.create).toHaveBeenCalledTimes(1);
+   });
+ });
+diff --git a/src/lib/whatsapp/resolve-conversation.ts b/src/lib/whatsapp/resolve-conversation.ts
+index d4b6f81..477ed27 100644
+--- a/src/lib/whatsapp/resolve-conversation.ts
++++ b/src/lib/whatsapp/resolve-conversation.ts
+@@ -6,67 +6,73 @@
+ // not an internal UUID. This helper bridges that: given an E.164
+ // phone, it finds-or-creates the contact and its conversation so the
+ // shared `sendMessageToConversation` core can run unchanged.
+ //
+ // It deliberately reuses the exact find-or-create logic the inbound
+ // webhook uses (the `findExistingContact` dedupe helper, the
+ // one-conversation-per-(account, contact) convention, the
+ // account_id-tenancy / user_id-audit split) so a contact created via
+ // the API is indistinguishable from one created by an inbound message.
+ //
++// Prisma-backed (Task D): the `db` argument on the public signature is
++// kept so not-yet-migrated callers keep compiling ÔÇö it is ignored by
++// this file; every query hits the `prisma` singleton, scoped by
++// `accountId` (application-level RLS). The shared helpers
++// (`findExistingContact`, `resolveAuditUserId`) are Prisma-backed too
++// and accept the now-ignored client.
++//
+ // Audit user: created rows need a NOT NULL `user_id`. As with the
+ // webhook (where there's no logged-in human either), we attribute
+ // them to the WhatsApp config owner ÔÇö a stable account-level default.
+ // ============================================================
+ 
+-import type { SupabaseClient } from '@supabase/supabase-js';
++import { prisma } from '@/lib/db/prisma';
+ 
+ import { findExistingContact, isUniqueViolation } from '@/lib/contacts/dedupe';
+ import { sanitizePhoneForMeta, isValidE164 } from '@/lib/whatsapp/phone-utils';
+ import { SendMessageError } from '@/lib/whatsapp/send-message';
+ import { resolveAuditUserId, ContactError } from '@/lib/api/v1/contacts';
+ 
+ export interface ResolvedConversation {
+   conversationId: string;
+   contactId: string;
+   /** True if this call created the contact (vs matched an existing one). */
+   contactCreated: boolean;
+ }
+ 
+ /**
+  * Find or create the contact + conversation for `phone` within
+  * `accountId`. Throws `SendMessageError` (shared with the send core,
+  * so the route maps one error family) on a bad phone, a missing
+  * WhatsApp config, or a DB failure.
+  */
+ export async function resolveConversationByPhone(
+-  db: SupabaseClient,
++  db: unknown,
+   accountId: string,
+   phone: string,
+   name?: string | null
+ ): Promise<ResolvedConversation> {
+   const sanitized = sanitizePhoneForMeta(phone);
+   if (!isValidE164(sanitized)) {
+     throw new SendMessageError(
+       'bad_request',
+       "'to' must be a valid phone number in E.164 format (e.g. +14155550123)",
+       400
+     );
+   }
+ 
+   // Fail fast (and create nothing) when the account has no WhatsApp
+   // connected ÔÇö the same error the send would raise anyway.
+-  const { data: config } = await db
+-    .from('whatsapp_config')
+-    .select('id')
+-    .eq('account_id', accountId)
+-    .maybeSingle();
++  const config = await prisma.whatsAppConfig.findFirst({
++    where: { accountId },
++    select: { id: true },
++  });
+   if (!config) {
+     throw new SendMessageError(
+       'whatsapp_not_configured',
+       'WhatsApp not configured. Please set up your WhatsApp integration first.',
+       400
+     );
+   }
+ 
+   // Audit user for created rows = the single account-wide default used
+   // by every public-API write (see resolveAuditUserId), so a contact
+@@ -85,61 +91,59 @@ export async function resolveConversationByPhone(
+   }
+ 
+   // ---- contact -------------------------------------------------
+   let contactId: string;
+   let contactCreated = false;
+ 
+   const existing = await findExistingContact(db, accountId, sanitized);
+   if (existing) {
+     contactId = existing.id;
+     if (name && name !== existing.name) {
+-      await db
+-        .from('contacts')
+-        .update({ name, updated_at: new Date().toISOString() })
+-        .eq('id', existing.id);
++      await prisma.contact.update({
++        where: { id: existing.id },
++        data: { name, updatedAt: new Date() },
++      });
+     }
+   } else {
+-    const { data: created, error: createErr } = await db
+-      .from('contacts')
+-      .insert({
+-        account_id: accountId,
+-        user_id: ownerUserId,
+-        phone: sanitized,
+-        name: name || sanitized,
+-      })
+-      .select('id')
+-      .single();
+-
+-    if (createErr || !created) {
++    try {
++      const created = await prisma.contact.create({
++        data: {
++          accountId,
++          userId: ownerUserId,
++          phone: sanitized,
++          name: name || sanitized,
++        },
++        select: { id: true },
++      });
++      contactId = created.id;
++      contactCreated = true;
++    } catch (createErr) {
+       // Lost a race against a concurrent inbound/API create ÔÇö the
+       // unique index (migration 022) rejected the duplicate. Re-resolve.
+       if (isUniqueViolation(createErr)) {
+         const raced = await findExistingContact(db, accountId, sanitized);
+         if (raced) {
+           contactId = raced.id;
+         } else {
+           throw new SendMessageError(
+             'db_error',
+             'Failed to create contact',
+             500
+           );
+         }
+       } else {
+         console.error(
+           '[resolve-conversation] contact create error:',
+           createErr
+         );
+         throw new SendMessageError('db_error', 'Failed to create contact', 500);
+       }
+-    } else {
+-      contactId = created.id;
+-      contactCreated = true;
+     }
+   }
+ 
+   // ---- conversation -------------------------------------------
+   // One conversation per (account, contact) ÔÇö same convention as the
+   // webhook. Order oldest-first and take one row rather than
+   // `.maybeSingle()`, which errors on ÔëÑ2 rows: if duplicates predate the
+   // unique index (migration 036), we resolve to the canonical survivor
+   // instead of falling through and creating yet another (issue #363).
+   const conversationId = await findOrCreateConversationRow(
+@@ -148,65 +152,58 @@ export async function resolveConversationByPhone(
+     contactId,
+     ownerUserId
+   );
+ 
+   return { conversationId, contactId, contactCreated };
+ }
+ 
+ /**
+  * Find (oldest-first) or create the single conversation for
+  * `(accountId, contactId)`. Handles the unique-index race the same way
+- * the inbound webhook does: on a 23505 from a concurrent create,
++ * the inbound webhook does: on a P2002/23505 from a concurrent create,
+  * re-resolve the winning row rather than failing the send.
+  */
+ async function findOrCreateConversationRow(
+-  db: SupabaseClient,
++  _db: unknown,
+   accountId: string,
+   contactId: string,
+   ownerUserId: string
+ ): Promise<string> {
+-  const { data: existing, error: findErr } = await db
+-    .from('conversations')
+-    .select('id')
+-    .eq('account_id', accountId)
+-    .eq('contact_id', contactId)
+-    .order('created_at', { ascending: true })
+-    .limit(1);
+-
+-  if (findErr) {
++  let existing: { id: string } | null;
++  try {
++    existing = await prisma.conversation.findFirst({
++      where: { accountId, contactId },
++      orderBy: { createdAt: 'asc' },
++      select: { id: true },
++    });
++  } catch (findErr) {
+     console.error('[resolve-conversation] conversation lookup error:', findErr);
+     throw new SendMessageError('db_error', 'Failed to resolve conversation', 500);
+   }
+ 
+-  if (existing && existing.length > 0) {
+-    return existing[0].id;
++  if (existing) {
++    return existing.id;
+   }
+ 
+-  const { data: newConv, error: convErr } = await db
+-    .from('conversations')
+-    .insert({
+-      account_id: accountId,
+-      user_id: ownerUserId,
+-      contact_id: contactId,
+-    })
+-    .select('id')
+-    .single();
+-
+-  if (convErr || !newConv) {
++  try {
++    const created = await prisma.conversation.create({
++      data: { accountId, userId: ownerUserId, contactId },
++      select: { id: true },
++    });
++    return created.id;
++  } catch (convErr) {
+     if (isUniqueViolation(convErr)) {
+-      const { data: raced } = await db
+-        .from('conversations')
+-        .select('id')
+-        .eq('account_id', accountId)
+-        .eq('contact_id', contactId)
+-        .order('created_at', { ascending: true })
+-        .limit(1);
+-      if (raced && raced.length > 0) {
+-        return raced[0].id;
++      const raced = await prisma.conversation
++        .findFirst({
++          where: { accountId, contactId },
++          orderBy: { createdAt: 'asc' },
++          select: { id: true },
++        })
++        .catch(() => null);
++      if (raced) {
++        return raced.id;
+       }
+     }
+     console.error('[resolve-conversation] conversation create error:', convErr);
+     throw new SendMessageError('db_error', 'Failed to create conversation', 500);
+   }
+-
+-  return newConv.id;
+ }

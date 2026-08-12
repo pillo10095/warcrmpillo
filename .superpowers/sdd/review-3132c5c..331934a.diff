@@ -1,0 +1,482 @@
+# Review package: 3132c5c..HEAD
+
+## Commits
+331934a feat(inbox): add Prisma row mappers for conversations and messages
+
+## Files changed
+ src/lib/inbox/conversations.test.ts | 194 ++++++++++++++++++++++++++++++++++++
+ src/lib/inbox/conversations.ts      |  57 +++++++++++
+ src/lib/inbox/messages.test.ts      | 109 ++++++++++++++++++++
+ src/lib/inbox/messages.ts           |  28 ++++++
+ 4 files changed, 388 insertions(+)
+
+## Diff
+diff --git a/src/lib/inbox/conversations.test.ts b/src/lib/inbox/conversations.test.ts
+index 7f76970..505f51a 100644
+--- a/src/lib/inbox/conversations.test.ts
++++ b/src/lib/inbox/conversations.test.ts
+@@ -1,17 +1,88 @@
+ import { describe, it, expect } from "vitest";
+ import {
+   matchesContactFilters,
+   normalizeConversation,
++  prismaToConversation,
+ } from "./conversations";
+ import type { Conversation } from "@/types";
+ 
++const ISO = "2025-01-01T00:00:00.000Z";
++
++type ConversationRow = Parameters<typeof prismaToConversation>[0];
++
++interface ContactFixture {
++  id: string;
++  accountId: string;
++  userId: string;
++  phone: string;
++  phoneNormalized: string | null;
++  name: string | null;
++  email: string | null;
++  company: string | null;
++  avatarUrl: string | null;
++  createdAt: Date;
++  updatedAt: Date;
++  contactTags: {
++    id: string;
++    contactId: string;
++    tagId: string;
++    createdAt: Date;
++    tag: {
++      id: string;
++      accountId: string;
++      userId: string;
++      name: string;
++      color: string;
++      createdAt: Date;
++    };
++  }[];
++}
++
++/** Full Prisma `Conversation` row shape (CONVERSATION_INCLUDE payload).
++ *  Cast because the Prisma payload types a required-relation include as
++ *  non-nullable, while the mapper itself handles `contact: null`. */
++function makePrismaRow(contact: ContactFixture | null): ConversationRow {
++  return {
++    id: "c1",
++    accountId: "a1",
++    userId: "u1",
++    contactId: "ct1",
++    status: "open",
++    assignedAgentId: null,
++    lastMessageText: null,
++    lastMessageAt: null,
++    unreadCount: 0,
++    createdAt: new Date(ISO),
++    updatedAt: new Date(ISO),
++    contact,
++  } as unknown as ConversationRow;
++}
++
++function makeContact(overrides: Partial<ContactFixture> = {}): ContactFixture {
++  return {
++    id: "ct1",
++    accountId: "a1",
++    userId: "u1",
++    phone: "+15551234567",
++    phoneNormalized: null,
++    name: "Ada",
++    email: null,
++    company: "Acme",
++    avatarUrl: null,
++    createdAt: new Date(ISO),
++    updatedAt: new Date(ISO),
++    contactTags: [],
++    ...overrides,
++  };
++}
++
+ function makeConversation(
+   contact: Partial<Conversation["contact"]> | null,
+ ): Conversation {
+   return {
+     id: "c1",
+     user_id: "u1",
+     contact_id: "ct1",
+     status: "open",
+     unread_count: 0,
+     created_at: "",
+@@ -136,10 +207,133 @@ describe("normalizeConversation", () => {
+       status: "open" as const,
+       unread_count: 0,
+       created_at: "",
+       updated_at: "",
+       contact: null,
+     };
+     // A contactless row passes through untouched (consumers use `?.`).
+     expect(normalizeConversation(raw).contact).toBeNull();
+   });
+ });
++
++describe("prismaToConversation", () => {
++  it("maps camelCase columns to the snake_case wire shape", () => {
++    const row = makePrismaRow(
++      makeContact({
++        contactTags: [
++          {
++            id: "j1",
++            contactId: "ct1",
++            tagId: "t1",
++            createdAt: new Date(ISO),
++            tag: {
++              id: "t1",
++              accountId: "a1",
++              userId: "u1",
++              name: "VIP",
++              color: "#fbbf24",
++              createdAt: new Date(ISO),
++            },
++          },
++        ],
++      }),
++    );
++    row.assignedAgentId = "agent-1";
++    row.lastMessageText = "Hello";
++    row.lastMessageAt = new Date("2025-01-02T00:00:00.000Z");
++    row.unreadCount = 3;
++
++    const mapped = prismaToConversation(row);
++
++    expect(mapped.id).toBe("c1");
++    expect(mapped.user_id).toBe("u1");
++    expect(mapped.contact_id).toBe("ct1");
++    expect(mapped.status).toBe("open");
++    expect(mapped.assigned_agent_id).toBe("agent-1");
++    expect(mapped.last_message_text).toBe("Hello");
++    expect(mapped.last_message_at).toBe("2025-01-02T00:00:00.000Z");
++    expect(mapped.unread_count).toBe(3);
++    expect(mapped.created_at).toBe(ISO);
++    expect(mapped.updated_at).toBe(ISO);
++  });
++
++  it("flattens contactTags[].tag into contact.tags", () => {
++    const row = makePrismaRow(
++      makeContact({
++        contactTags: [
++          {
++            id: "j1",
++            contactId: "ct1",
++            tagId: "t1",
++            createdAt: new Date(ISO),
++            tag: {
++              id: "t1",
++              accountId: "a1",
++              userId: "u1",
++              name: "VIP",
++              color: "#fbbf24",
++              createdAt: new Date(ISO),
++            },
++          },
++          {
++            id: "j2",
++            contactId: "ct1",
++            tagId: "t2",
++            createdAt: new Date(ISO),
++            tag: {
++              id: "t2",
++              accountId: "a1",
++              userId: "u1",
++              name: "Lead",
++              color: "#3b82f6",
++              createdAt: new Date(ISO),
++            },
++          },
++        ],
++      }),
++    );
++
++    const mapped = prismaToConversation(row);
++
++    expect(mapped.contact?.tags).toEqual([
++      {
++        id: "t1",
++        user_id: "u1",
++        name: "VIP",
++        color: "#fbbf24",
++        created_at: ISO,
++      },
++      {
++        id: "t2",
++        user_id: "u1",
++        name: "Lead",
++        color: "#3b82f6",
++        created_at: ISO,
++      },
++    ]);
++  });
++
++  it("maps the embedded contact and drops the join wrapper", () => {
++    const mapped = prismaToConversation(makePrismaRow(makeContact()));
++
++    expect(mapped.contact).toEqual({
++      id: "ct1",
++      user_id: "u1",
++      account_id: "a1",
++      phone: "+15551234567",
++      phone_normalized: undefined,
++      name: "Ada",
++      email: undefined,
++      company: "Acme",
++      avatar_url: undefined,
++      created_at: ISO,
++      updated_at: ISO,
++      tags: [],
++    });
++  });
++
++  it("handles a null contact", () => {
++    const mapped = prismaToConversation(makePrismaRow(null));
++
++    expect(mapped.contact).toBeUndefined();
++  });
++});
+diff --git a/src/lib/inbox/conversations.ts b/src/lib/inbox/conversations.ts
+index b185cb1..9c02643 100644
+--- a/src/lib/inbox/conversations.ts
++++ b/src/lib/inbox/conversations.ts
+@@ -1,10 +1,11 @@
++import type { Prisma } from '@prisma/client';
+ import type { Conversation, Contact, Tag } from "@/types";
+ 
+ /**
+  * Conversation select that embeds the contact plus its tags, so the Inbox
+  * can filter conversations by contact tag without a second round-trip.
+  * `contact_tags(tags(*))` returns the join rows; {@link normalizeConversation}
+  * flattens them onto `contact.tags`.
+  */
+ export const CONVERSATION_SELECT =
+   "*, contact:contacts(*, contact_tags(tags(*)))";
+@@ -35,20 +36,76 @@ export function normalizeConversation(raw: RawConversation): Conversation {
+     },
+   };
+ }
+ 
+ export function normalizeConversations(
+   rows: RawConversation[],
+ ): Conversation[] {
+   return rows.map(normalizeConversation);
+ }
+ 
++/** Prisma include that embeds the contact + its tags ÔÇö the MySQL
++ *  replacement for the Supabase {@link CONVERSATION_SELECT} string. */
++export const CONVERSATION_INCLUDE = {
++  contact: { include: { contactTags: { include: { tag: true } } } },
++} satisfies Prisma.ConversationInclude;
++
++type ConversationRow = Prisma.ConversationGetPayload<{
++  include: typeof CONVERSATION_INCLUDE;
++}>;
++
++/** Map a Prisma conversation row (camelCase, nested contactTags) into
++ *  the snake_case wire `Conversation` shape ÔÇö same output the Supabase
++ *  {@link normalizeConversation} produced, so v1 serializers see no
++ *  change. */
++export function prismaToConversation(row: ConversationRow): Conversation {
++  return {
++    id: row.id,
++    user_id: row.userId,
++    contact_id: row.contactId,
++    status: row.status,
++    assigned_agent_id: row.assignedAgentId ?? undefined,
++    last_message_text: row.lastMessageText ?? undefined,
++    last_message_at: row.lastMessageAt?.toISOString() ?? undefined,
++    unread_count: row.unreadCount,
++    created_at: row.createdAt.toISOString(),
++    updated_at: row.updatedAt.toISOString(),
++    contact: row.contact
++      ? {
++          id: row.contact.id,
++          user_id: row.contact.userId,
++          account_id: row.contact.accountId,
++          phone: row.contact.phone,
++          phone_normalized: row.contact.phoneNormalized ?? undefined,
++          name: row.contact.name ?? undefined,
++          email: row.contact.email ?? undefined,
++          company: row.contact.company ?? undefined,
++          avatar_url: row.contact.avatarUrl ?? undefined,
++          created_at: row.contact.createdAt.toISOString(),
++          updated_at: row.contact.updatedAt.toISOString(),
++          tags: (row.contact.contactTags ?? [])
++            .map((ct) => ct.tag)
++            .filter((t): t is Prisma.TagGetPayload<Record<string, never>> =>
++              t != null,
++            )
++            .map((t) => ({
++              id: t.id,
++              user_id: t.userId,
++              name: t.name,
++              color: t.color,
++              created_at: t.createdAt.toISOString(),
++            })),
++        }
++      : undefined,
++  };
++}
++
+ export interface ContactFilters {
+   /** Tag ids; a conversation matches if its contact has ANY of them (OR). */
+   tagIds: string[];
+   /** Exact company match, or null for no company filter. */
+   company: string | null;
+ }
+ 
+ /**
+  * Whether a conversation passes the contact-based Inbox filters (issue #272).
+  * Empty `tagIds` and null `company` are no-ops, so the default (no filters)
+diff --git a/src/lib/inbox/messages.test.ts b/src/lib/inbox/messages.test.ts
+new file mode 100644
+index 0000000..8f66a3c
+--- /dev/null
++++ b/src/lib/inbox/messages.test.ts
+@@ -0,0 +1,109 @@
++import { describe, it, expect } from 'vitest';
++import { prismaToMessage } from './messages';
++
++const ISO = '2025-01-01T00:00:00.000Z';
++
++type MessageRow = Parameters<typeof prismaToMessage>[0];
++
++function makePrismaMessageRow(overrides: Partial<MessageRow> = {}): MessageRow {
++  return {
++    id: 'm1',
++    conversationId: 'c1',
++    senderType: 'customer',
++    senderId: 'ct1',
++    contentType: 'text',
++    contentText: 'Hello',
++    mediaUrl: null,
++    templateName: null,
++    messageId: 'wamid-1',
++    status: 'sent',
++    replyToMessageId: null,
++    interactiveReplyId: null,
++    interactivePayload: null,
++    aiGenerated: false,
++    createdAt: new Date(ISO),
++    ...overrides,
++  } as MessageRow;
++}
++
++describe('prismaToMessage', () => {
++  it('maps camelCase columns to the snake_case wire shape', () => {
++    const mapped = prismaToMessage(
++      makePrismaMessageRow({
++        senderType: 'agent',
++        contentType: 'image',
++        mediaUrl: 'https://example.com/a.png',
++        templateName: 'welcome',
++        messageId: 'wamid-9',
++        status: 'read',
++        replyToMessageId: 'm0',
++        interactiveReplyId: 'row-1',
++        aiGenerated: true,
++      })
++    );
++
++    expect(mapped).toMatchObject({
++      id: 'm1',
++      conversation_id: 'c1',
++      sender_type: 'agent',
++      sender_id: 'ct1',
++      content_type: 'image',
++      content_text: 'Hello',
++      media_url: 'https://example.com/a.png',
++      template_name: 'welcome',
++      message_id: 'wamid-9',
++      status: 'read',
++      reply_to_message_id: 'm0',
++      interactive_reply_id: 'row-1',
++      ai_generated: true,
++      created_at: ISO,
++    });
++  });
++
++  it('maps messageId to message_id', () => {
++    const mapped = prismaToMessage(makePrismaMessageRow());
++
++    expect(mapped.message_id).toBe('wamid-1');
++    expect(mapped).not.toHaveProperty('messageId');
++  });
++
++  it('maps a persisted interactive payload onto interactive_payload', () => {
++    const payload = {
++      kind: 'buttons',
++      body: 'Pick one',
++      buttons: [{ id: 'b1', title: 'Yes' }],
++    };
++    const mapped = prismaToMessage(
++      makePrismaMessageRow({
++        contentType: 'interactive',
++        interactivePayload: payload,
++      })
++    );
++
++    expect(mapped.interactive_payload).toEqual(payload);
++  });
++
++  it('turns null optionals into undefined', () => {
++    const mapped = prismaToMessage(
++      makePrismaMessageRow({
++        senderId: null,
++        contentText: null,
++        mediaUrl: null,
++        templateName: null,
++        messageId: null,
++        replyToMessageId: null,
++        interactiveReplyId: null,
++        interactivePayload: null,
++      })
++    );
++
++    expect(mapped.sender_id).toBeUndefined();
++    expect(mapped.content_text).toBeUndefined();
++    expect(mapped.media_url).toBeUndefined();
++    expect(mapped.template_name).toBeUndefined();
++    expect(mapped.message_id).toBeUndefined();
++    expect(mapped.reply_to_message_id).toBeUndefined();
++    expect(mapped.interactive_reply_id).toBeUndefined();
++    expect(mapped.interactive_payload).toBeUndefined();
++  });
++});
+diff --git a/src/lib/inbox/messages.ts b/src/lib/inbox/messages.ts
+new file mode 100644
+index 0000000..da45615
+--- /dev/null
++++ b/src/lib/inbox/messages.ts
+@@ -0,0 +1,28 @@
++import type { Prisma } from '@prisma/client';
++import type { Message } from '@/types';
++
++type MessageRow = Prisma.MessageGetPayload<Record<string, never>>;
++
++/** Map a Prisma message row (camelCase) into the snake_case wire
++ *  `Message` shape consumed by the v1 serializer. */
++export function prismaToMessage(row: MessageRow): Message {
++  return {
++    id: row.id,
++    conversation_id: row.conversationId,
++    sender_type: row.senderType,
++    sender_id: row.senderId ?? undefined,
++    content_type: row.contentType,
++    content_text: row.contentText ?? undefined,
++    media_url: row.mediaUrl ?? undefined,
++    template_name: row.templateName ?? undefined,
++    message_id: row.messageId ?? undefined,
++    status: row.status,
++    reply_to_message_id: row.replyToMessageId ?? undefined,
++    interactive_reply_id: row.interactiveReplyId ?? undefined,
++    interactive_payload:
++      (row.interactivePayload as unknown as Message['interactive_payload']) ??
++      undefined,
++    ai_generated: row.aiGenerated,
++    created_at: row.createdAt.toISOString(),
++  };
++}

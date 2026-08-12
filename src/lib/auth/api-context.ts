@@ -26,7 +26,7 @@
 // lookup time.
 // ============================================================
 
-import type { SupabaseClient } from '@supabase/supabase-js';
+import type { SupabaseQueryBuilder } from '@/lib/supabase/query-builder';
 
 import { findActiveKeyByHash, touchLastUsed } from '@/lib/api-keys/store';
 import { hashApiKey, looksLikeApiKey } from '@/lib/api-keys/keys';
@@ -44,7 +44,7 @@ export interface ApiKeyContext {
    * Supabase — this is ALWAYS null at runtime, and is deleted when
    * those routes migrate to Prisma.
    */
-  supabase: SupabaseClient;
+  supabase: SupabaseQueryBuilder;
   /** The account this key belongs to. */
   accountId: string;
   /** The key row id — for audit logging and the rate-limit bucket. */
@@ -114,9 +114,9 @@ export async function requireApiKey(
   return {
     authType: 'api_key',
     // Always null — see the interface comment. Cast only because the
-    // field's type is pinned to `SupabaseClient` so the deferred CRM
+    // field's type is pinned to `SupabaseQueryBuilder` so the deferred CRM
     // v1 routes keep compiling until they migrate to Prisma.
-    supabase: null as unknown as SupabaseClient,
+    supabase: null as unknown as SupabaseQueryBuilder,
     accountId: row.accountId,
     keyId: row.id,
     scopes: row.scopes,

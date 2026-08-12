@@ -1,0 +1,135 @@
+- generic [active] [ref=e1]:
+  - generic [ref=e2]:
+    - complementary "Primary" [ref=e3]:
+      - link "CRM Template for WhatsApp" [ref=e5] [cursor=pointer]:
+        - /url: /dashboard
+        - img [ref=e7]
+        - generic [ref=e9]: CRM Template for WhatsApp
+      - navigation [ref=e10]:
+        - list [ref=e11]:
+          - listitem [ref=e12]:
+            - link "Dashboard" [ref=e13] [cursor=pointer]:
+              - /url: /dashboard
+              - img [ref=e14]
+              - generic [ref=e19]: Dashboard
+          - listitem [ref=e20]:
+            - link "Inbox" [ref=e21] [cursor=pointer]:
+              - /url: /inbox
+              - img [ref=e22]
+              - generic [ref=e24]: Inbox
+          - listitem [ref=e25]:
+            - link "Notifications" [ref=e26] [cursor=pointer]:
+              - /url: /notifications
+              - img [ref=e27]
+              - generic [ref=e30]: Notifications
+          - listitem [ref=e31]:
+            - link "Contacts" [ref=e32] [cursor=pointer]:
+              - /url: /contacts
+              - img [ref=e33]
+              - generic [ref=e38]: Contacts
+          - listitem [ref=e39]:
+            - link "Pipelines" [ref=e40] [cursor=pointer]:
+              - /url: /pipelines
+              - img [ref=e41]
+              - generic [ref=e45]: Pipelines
+          - listitem [ref=e46]:
+            - link "Broadcasts" [ref=e47] [cursor=pointer]:
+              - /url: /broadcasts
+              - img [ref=e48]
+              - generic [ref=e54]: Broadcasts
+          - listitem [ref=e55]:
+            - link "Automations" [ref=e56] [cursor=pointer]:
+              - /url: /automations
+              - img [ref=e57]
+              - generic [ref=e59]: Automations
+          - listitem [ref=e60]:
+            - link "Flows Beta" [ref=e61] [cursor=pointer]:
+              - /url: /flows
+              - img [ref=e62]
+              - generic [ref=e66]: Flows
+              - generic "Beta" [ref=e67]
+          - listitem [ref=e68]:
+            - link "AI Agents" [ref=e69] [cursor=pointer]:
+              - /url: /agents
+              - img [ref=e70]
+              - generic [ref=e73]: AI Agents
+        - list [ref=e75]:
+          - listitem [ref=e76]:
+            - link "Settings" [ref=e77] [cursor=pointer]:
+              - /url: /settings
+              - img [ref=e78]
+              - text: Settings
+      - button "A Admin admin@wacrm.test" [ref=e82]:
+        - generic [ref=e84]: A
+        - generic [ref=e85]:
+          - paragraph [ref=e86]: Admin
+          - paragraph [ref=e87]: admin@wacrm.test
+    - generic [ref=e88]:
+      - banner [ref=e89]:
+        - heading "Dashboard" [level=1] [ref=e91]
+        - generic [ref=e92]:
+          - button "Switch to light mode" [ref=e93]:
+            - img [ref=e94]
+          - button "Open account menu" [ref=e96]:
+            - generic [ref=e98]: A
+            - generic [ref=e99]: Admin
+      - main [ref=e100]:
+        - generic [ref=e101]:
+          - generic [ref=e102]:
+            - heading "Dashboard" [level=1] [ref=e103]
+            - paragraph [ref=e104]: Live analytics across conversations, contacts, deals, broadcasts, and automations.
+          - generic [ref=e122]:
+            - link "New Contact" [ref=e123] [cursor=pointer]:
+              - /url: /contacts
+              - img [ref=e125]
+              - generic [ref=e128]: New Contact
+            - link "New Deal" [ref=e129] [cursor=pointer]:
+              - /url: /pipelines
+              - img [ref=e131]
+              - generic [ref=e134]: New Deal
+            - link "New Broadcast" [ref=e135] [cursor=pointer]:
+              - /url: /broadcasts/new
+              - img [ref=e137]
+              - generic [ref=e143]: New Broadcast
+            - link "New Automation" [ref=e144] [cursor=pointer]:
+              - /url: /automations/new
+              - img [ref=e146]
+              - generic [ref=e148]: New Automation
+          - generic [ref=e149]:
+            - generic [ref=e151]:
+              - generic [ref=e152]:
+                - generic [ref=e153]:
+                  - heading "Conversations Over Time" [level=2] [ref=e154]
+                  - paragraph [ref=e155]: Daily message volume by direction
+                - generic [ref=e156]:
+                  - button "7 days" [ref=e157]
+                  - button "30 days" [ref=e158]
+                  - button "90 days" [ref=e159]
+              - generic [ref=e162]:
+                - generic [ref=e163]: Incoming
+                - generic [ref=e165]: Outgoing
+            - generic [ref=e169]:
+              - heading "Pipeline Value" [level=2] [ref=e170]
+              - paragraph [ref=e171]: Open deals by stage
+          - generic [ref=e175]:
+            - generic [ref=e176]:
+              - heading "Average First Response Time" [level=2] [ref=e177]
+              - paragraph [ref=e178]: Minutes to reply to a customer's first unreplied message, by weekday
+            - generic [ref=e180]: target 5m
+          - generic [ref=e184]:
+            - heading "Recent Activity" [level=2] [ref=e185]
+            - link "View all →" [ref=e186] [cursor=pointer]:
+              - /url: /inbox
+  - region "Notifications alt+T"
+  - generic [ref=e197] [cursor=pointer]:
+    - button "Open Next.js Dev Tools" [ref=e198]:
+      - img [ref=e199]
+    - generic [ref=e202]:
+      - button "Open issues overlay" [ref=e203]:
+        - generic [ref=e204]:
+          - generic [ref=e205]: "0"
+          - generic [ref=e206]: "1"
+        - generic [ref=e207]: Issue
+      - button "Collapse issues badge" [ref=e208]:
+        - img [ref=e209]
+  - alert [ref=e211]

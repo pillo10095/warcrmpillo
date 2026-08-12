@@ -1,18 +1,15 @@
-import { createBrowserClient } from '@supabase/ssr'
-import type { SupabaseClient } from '@supabase/supabase-js'
+import { createSupabaseQueryBuilder, type SupabaseQueryBuilder } from './query-builder'
 
-// Singleton instance — one client shared across the whole browser session.
-// Creating multiple clients causes auth-lock contention ("Lock was released
-// because another request stole it") and intermittent fetch failures.
-let browserClient: SupabaseClient | undefined
+// Singleton — one client shared across the whole browser session.
+let _client: SupabaseQueryBuilder | undefined
 
-export function createClient() {
-  if (browserClient) return browserClient
+export function createClient(): SupabaseQueryBuilder {
+  if (_client) return _client
 
-  browserClient = createBrowserClient(
-    process.env.NEXT_PUBLIC_SUPABASE_URL!,
-    process.env.NEXT_PUBLIC_SUPABASE_ANON_KEY!
-  )
+  _client = createSupabaseQueryBuilder({
+    baseUrl: '',
+    headers: {},
+  })
 
-  return browserClient
+  return _client
 }

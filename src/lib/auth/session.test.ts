@@ -24,7 +24,7 @@ describe("session", () => {
     expect(token).toHaveLength(96); // 48 bytes hex
     expect(expiresAt.getTime()).toBeGreaterThan(Date.now());
     const saved = mockDb.session.create.mock.calls[0][0];
-    expect(saved.data.tokenHash).toBe(hashToken(token));
+    expect(saved.data.tokenHash).toBe(await hashToken(token));
     expect(saved.data.tokenHash).not.toBe(token);
   });
 
@@ -56,6 +56,6 @@ describe("session", () => {
 
   it("deletes a session", async () => {
     await deleteSession("tok");
-    expect(mockDb.session.delete).toHaveBeenCalledWith({ where: { tokenHash: hashToken("tok") } });
+    expect(mockDb.session.delete).toHaveBeenCalledWith({ where: { tokenHash: await hashToken("tok") } });
   });
 });

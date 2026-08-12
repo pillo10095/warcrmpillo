@@ -1,0 +1,836 @@
+# Review package: cb3dd49..40acfbe
+
+## Commits
+40acfbe feat(v1): migrate conversations and messages routes to Prisma
+
+## Files changed
+ .../v1/conversations/[id]/messages/route.test.ts   | 179 +++++++++++++++
+ .../api/v1/conversations/[id]/messages/route.ts    |  57 ++---
+ src/app/api/v1/conversations/[id]/route.test.ts    | 111 ++++++++++
+ src/app/api/v1/conversations/[id]/route.ts         |  27 +--
+ src/app/api/v1/conversations/route.test.ts         | 242 +++++++++++++++++++++
+ src/app/api/v1/conversations/route.ts              |  69 +++---
+ 6 files changed, 617 insertions(+), 68 deletions(-)
+
+## Diff
+diff --git a/src/app/api/v1/conversations/[id]/messages/route.test.ts b/src/app/api/v1/conversations/[id]/messages/route.test.ts
+new file mode 100644
+index 0000000..62256c0
+--- /dev/null
++++ b/src/app/api/v1/conversations/[id]/messages/route.test.ts
+@@ -0,0 +1,179 @@
++import { beforeEach, describe, expect, it, vi } from 'vitest';
++
++const mocks = vi.hoisted(() => ({
++  requireApiKey: vi.fn(),
++  prisma: {
++    conversation: { findFirst: vi.fn() },
++    message: { findMany: vi.fn() },
++  },
++}));
++
++vi.mock('@/lib/auth/api-context', () => ({
++  requireApiKey: mocks.requireApiKey,
++}));
++vi.mock('@/lib/db/prisma', () => ({ prisma: mocks.prisma }));
++
++import { GET } from './route';
++import { encodeCursor } from '@/lib/api/v1/pagination';
++
++const ctx = {
++  accountId: 'acct-1',
++  keyId: 'key-1',
++  scopes: ['messages:read'],
++  createdBy: null,
++};
++
++function messageRow(id: string, overrides: Record<string, unknown> = {}) {
++  return {
++    id,
++    conversationId: 'conv-1',
++    senderType: 'customer',
++    senderId: 'ct-1',
++    contentType: 'text',
++    contentText: 'hello',
++    mediaUrl: null,
++    templateName: null,
++    messageId: 'wamid-1',
++    status: 'sent',
++    replyToMessageId: null,
++    interactiveReplyId: null,
++    interactivePayload: null,
++    aiGenerated: false,
++    createdAt: new Date('2026-01-01T00:00:00Z'),
++    ...overrides,
++  };
++}
++
++function getRequest(
++  url = 'https://crm.example.com/api/v1/conversations/conv-1/messages'
++) {
++  return new Request(url);
++}
++
++function params(id: string) {
++  return { params: Promise.resolve({ id }) };
++}
++
++beforeEach(() => {
++  mocks.requireApiKey.mockReset().mockResolvedValue(ctx);
++});
++
++describe('GET /api/v1/conversations/[id]/messages', () => {
++  it('gates on account ownership of the conversation first', async () => {
++    mocks.prisma.conversation.findFirst.mockResolvedValue(null);
++
++    const response = await GET(getRequest(), params('conv-foreign'));
++    const body = await response.json();
++
++    expect(response.status).toBe(404);
++    expect(body.error.code).toBe('not_found');
++    expect(mocks.prisma.message.findMany).not.toHaveBeenCalled();
++  });
++
++  it('lists the conversation messages scoped to the id', async () => {
++    mocks.prisma.conversation.findFirst.mockResolvedValue({ id: 'conv-1' });
++    mocks.prisma.message.findMany.mockResolvedValue([
++      messageRow('m-1'),
++      messageRow('m-2', { senderType: 'agent', contentText: 'hi' }),
++    ]);
++
++    const response = await GET(getRequest(), params('conv-1'));
++    const body = await response.json();
++
++    expect(response.status).toBe(200);
++    expect(body.data.map((m: { id: string }) => m.id)).toEqual(['m-1', 'm-2']);
++    expect(body.meta.next_cursor).toBeNull();
++    expect(mocks.prisma.message.findMany).toHaveBeenCalledWith(
++      expect.objectContaining({
++        where: { conversationId: 'conv-1' },
++        orderBy: [{ createdAt: 'desc' }, { id: 'desc' }],
++      })
++    );
++  });
++
++  it('serializes direction from sender_type', async () => {
++    mocks.prisma.conversation.findFirst.mockResolvedValue({ id: 'conv-1' });
++    mocks.prisma.message.findMany.mockResolvedValue([
++      messageRow('m-1'),
++      messageRow('m-2', { senderType: 'agent' }),
++      messageRow('m-3', { senderType: 'bot' }),
++    ]);
++
++    const response = await GET(getRequest(), params('conv-1'));
++    const body = await response.json();
++
++    expect(body.data.map((m: { direction: string }) => m.direction)).toEqual([
++      'inbound',
++      'outbound',
++      'outbound',
++    ]);
++  });
++
++  it('maps a keyset cursor onto the message where', async () => {
++    mocks.prisma.conversation.findFirst.mockResolvedValue({ id: 'conv-1' });
++    mocks.prisma.message.findMany.mockResolvedValue([messageRow('m-2')]);
++    const cursorId = 'aaaaaaaa-0000-4000-8000-000000000001';
++    const cursor = encodeCursor({
++      created_at: '2026-01-01T00:00:00Z',
++      id: cursorId,
++    });
++
++    await GET(
++      getRequest(
++        `https://crm.example.com/api/v1/conversations/conv-1/messages?cursor=${encodeURIComponent(cursor)}`
++      ),
++      params('conv-1')
++    );
++
++    expect(mocks.prisma.message.findMany).toHaveBeenCalledWith(
++      expect.objectContaining({
++        where: {
++          conversationId: 'conv-1',
++          OR: [
++            { createdAt: { lt: new Date('2026-01-01T00:00:00Z') } },
++            {
++              AND: [
++                { createdAt: new Date('2026-01-01T00:00:00Z') },
++                { id: { lt: cursorId } },
++              ],
++            },
++          ],
++        },
++      })
++    );
++  });
++
++  it('returns a next_cursor when more rows exist than the limit', async () => {
++    mocks.prisma.conversation.findFirst.mockResolvedValue({ id: 'conv-1' });
++    mocks.prisma.message.findMany.mockResolvedValue([
++      messageRow('m-1'),
++      messageRow('m-2'),
++      messageRow('m-3'),
++    ]);
++
++    const response = await GET(
++      getRequest(
++        'https://crm.example.com/api/v1/conversations/conv-1/messages?limit=2'
++      ),
++      params('conv-1')
++    );
++    const body = await response.json();
++
++    expect(body.data).toHaveLength(2);
++    expect(body.meta.next_cursor).not.toBeNull();
++    expect(mocks.prisma.message.findMany).toHaveBeenCalledWith(
++      expect.objectContaining({ take: 3 })
++    );
++  });
++
++  it('returns a 500 envelope when the message query fails', async () => {
++    mocks.prisma.conversation.findFirst.mockResolvedValue({ id: 'conv-1' });
++    mocks.prisma.message.findMany.mockRejectedValue(new Error('db down'));
++
++    const response = await GET(getRequest(), params('conv-1'));
++    const body = await response.json();
++
++    expect(response.status).toBe(500);
++    expect(body.error.code).toBe('internal');
++  });
++});
+diff --git a/src/app/api/v1/conversations/[id]/messages/route.ts b/src/app/api/v1/conversations/[id]/messages/route.ts
+index 5b29121..3418aeb 100644
+--- a/src/app/api/v1/conversations/[id]/messages/route.ts
++++ b/src/app/api/v1/conversations/[id]/messages/route.ts
+@@ -1,65 +1,70 @@
+ // ============================================================
+ // GET /api/v1/conversations/{id}/messages ÔÇö list a conversation's
+ // messages (scope: messages:read), newest first, keyset-paginated.
+ //
+ // The conversation is verified to belong to the key's account before
+ // any message is returned ÔÇö a foreign or unknown id ÔåÆ 404.
++//
++// Prisma-backed: ownership gate + message query both scoped by
++// `ctx.accountId`.
+ // ============================================================
+ 
++import type { Prisma } from '@prisma/client';
++
+ import { requireApiKey } from '@/lib/auth/api-context';
+ import { okList, fail, toApiErrorResponse } from '@/lib/api/v1/respond';
+-import {
+-  parseListParams,
+-  keysetFilter,
+-  buildPage,
+-} from '@/lib/api/v1/pagination';
++import { parseListParams, buildPage } from '@/lib/api/v1/pagination';
+ import { serializeMessage } from '@/lib/api/v1/conversations';
+-import type { Message } from '@/types';
++import { prismaToMessage } from '@/lib/inbox/messages';
++import { prisma } from '@/lib/db/prisma';
+ 
+ export async function GET(
+   request: Request,
+   { params }: { params: Promise<{ id: string }> }
+ ) {
+   try {
+     const ctx = await requireApiKey(request, 'messages:read');
+     const { id } = await params;
+     const { limit, cursor } = parseListParams(request);
+ 
+     // Gate on account ownership of the conversation first.
+-    const { data: conv } = await ctx.supabase
+-      .from('conversations')
+-      .select('id')
+-      .eq('id', id)
+-      .eq('account_id', ctx.accountId)
+-      .maybeSingle();
++    const conv = await prisma.conversation.findFirst({
++      where: { id, accountId: ctx.accountId },
++      select: { id: true },
++    });
+     if (!conv) return fail('not_found', 'Conversation not found', 404);
+ 
+-    let query = ctx.supabase
+-      .from('messages')
+-      .select('*')
+-      .eq('conversation_id', id)
+-      .order('created_at', { ascending: false })
+-      .order('id', { ascending: false })
+-      .limit(limit + 1);
+-
+-    const kf = keysetFilter(cursor);
+-    if (kf) query = query.or(kf);
++    const where: Prisma.MessageWhereInput = { conversationId: id };
++    if (cursor) {
++      const at = new Date(cursor.createdAt);
++      where.OR = [
++        { createdAt: { lt: at } },
++        { AND: [{ createdAt: at }, { id: { lt: cursor.id } }] },
++      ];
++    }
+ 
+-    const { data, error } = await query;
+-    if (error) {
++    let rows;
++    try {
++      rows = await prisma.message.findMany({
++        where,
++        orderBy: [{ createdAt: 'desc' }, { id: 'desc' }],
++        take: limit + 1,
++      });
++    } catch (error) {
+       console.error('[api/v1/messages] list error:', error);
+       return fail('internal', 'Failed to list messages', 500);
+     }
+ 
+     const { items, nextCursor } = buildPage(
+-      (data ?? []) as Array<{ created_at: string; id: string }>,
++      rows.map((r) => ({ created_at: r.createdAt.toISOString(), id: r.id })),
+       limit
+     );
++    const byId = new Map(rows.map((r) => [r.id, r]));
+     return okList(
+-      items.map((m) => serializeMessage(m as unknown as Message)),
++      items.map((r) => serializeMessage(prismaToMessage(byId.get(r.id)!))),
+       nextCursor
+     );
+   } catch (err) {
+     return toApiErrorResponse(err);
+   }
+ }
+diff --git a/src/app/api/v1/conversations/[id]/route.test.ts b/src/app/api/v1/conversations/[id]/route.test.ts
+new file mode 100644
+index 0000000..67a771b
+--- /dev/null
++++ b/src/app/api/v1/conversations/[id]/route.test.ts
+@@ -0,0 +1,111 @@
++import { beforeEach, describe, expect, it, vi } from 'vitest';
++
++const mocks = vi.hoisted(() => ({
++  requireApiKey: vi.fn(),
++  prisma: {
++    conversation: { findFirst: vi.fn() },
++  },
++}));
++
++vi.mock('@/lib/auth/api-context', () => ({
++  requireApiKey: mocks.requireApiKey,
++}));
++vi.mock('@/lib/db/prisma', () => ({ prisma: mocks.prisma }));
++
++import { GET } from './route';
++
++const ctx = {
++  accountId: 'acct-1',
++  keyId: 'key-1',
++  scopes: ['conversations:read'],
++  createdBy: null,
++};
++
++function conversationRow(id: string, overrides: Record<string, unknown> = {}) {
++  return {
++    id,
++    accountId: 'acct-1',
++    userId: 'owner-1',
++    contactId: 'ct-1',
++    status: 'open',
++    assignedAgentId: null,
++    lastMessageText: null,
++    lastMessageAt: null,
++    unreadCount: 0,
++    createdAt: new Date('2026-01-01T00:00:00Z'),
++    updatedAt: new Date('2026-01-01T00:00:00Z'),
++    contact: {
++      id: 'ct-1',
++      accountId: 'acct-1',
++      userId: 'owner-1',
++      phone: '+14155550123',
++      phoneNormalized: '14155550123',
++      name: 'Jane',
++      email: null,
++      company: null,
++      avatarUrl: null,
++      createdAt: new Date('2026-01-01T00:00:00Z'),
++      updatedAt: new Date('2026-01-01T00:00:00Z'),
++      contactTags: [],
++    },
++    ...overrides,
++  };
++}
++
++function getRequest(url = 'https://crm.example.com/api/v1/conversations/conv-1') {
++  return new Request(url);
++}
++
++function params(id: string) {
++  return { params: Promise.resolve({ id }) };
++}
++
++beforeEach(() => {
++  mocks.requireApiKey.mockReset().mockResolvedValue(ctx);
++});
++
++describe('GET /api/v1/conversations/[id]', () => {
++  it('reads one conversation scoped to the account', async () => {
++    mocks.prisma.conversation.findFirst.mockResolvedValue(
++      conversationRow('conv-1')
++    );
++
++    const response = await GET(getRequest(), params('conv-1'));
++    const body = await response.json();
++
++    expect(response.status).toBe(200);
++    expect(body.data.id).toBe('conv-1');
++    expect(mocks.prisma.conversation.findFirst).toHaveBeenCalledWith(
++      expect.objectContaining({
++        where: { id: 'conv-1', accountId: 'acct-1' },
++      })
++    );
++  });
++
++  it('returns 404 for an unknown or foreign id', async () => {
++    mocks.prisma.conversation.findFirst.mockResolvedValue(null);
++
++    const response = await GET(getRequest(), params('conv-foreign'));
++    const body = await response.json();
++
++    expect(response.status).toBe(404);
++    expect(body.error.code).toBe('not_found');
++    expect(mocks.prisma.conversation.findFirst).toHaveBeenCalledWith(
++      expect.objectContaining({
++        where: { id: 'conv-foreign', accountId: 'acct-1' },
++      })
++    );
++  });
++
++  it('returns a 500 envelope when the query fails', async () => {
++    mocks.prisma.conversation.findFirst.mockRejectedValue(
++      new Error('db down')
++    );
++
++    const response = await GET(getRequest(), params('conv-1'));
++    const body = await response.json();
++
++    expect(response.status).toBe(500);
++    expect(body.error.code).toBe('internal');
++  });
++});
+diff --git a/src/app/api/v1/conversations/[id]/route.ts b/src/app/api/v1/conversations/[id]/route.ts
+index cf50746..114fd21 100644
+--- a/src/app/api/v1/conversations/[id]/route.ts
++++ b/src/app/api/v1/conversations/[id]/route.ts
+@@ -1,40 +1,35 @@
+ // ============================================================
+ // GET /api/v1/conversations/{id} ÔÇö read one conversation
+ // (scope: conversations:read). Account-scoped: a foreign id ÔåÆ 404.
++//
++// Prisma-backed: query explicitly scoped by `ctx.accountId`.
+ // ============================================================
+ 
+ import { requireApiKey } from '@/lib/auth/api-context';
+ import { ok, fail, toApiErrorResponse } from '@/lib/api/v1/respond';
+ import {
+-  CONVERSATION_SELECT,
+-  normalizeConversation,
++  CONVERSATION_INCLUDE,
++  prismaToConversation,
+ } from '@/lib/inbox/conversations';
+ import { serializeConversation } from '@/lib/api/v1/conversations';
+-import type { Conversation } from '@/types';
++import { prisma } from '@/lib/db/prisma';
+ 
+ export async function GET(
+   request: Request,
+   { params }: { params: Promise<{ id: string }> }
+ ) {
+   try {
+     const ctx = await requireApiKey(request, 'conversations:read');
+     const { id } = await params;
+ 
+-    const { data, error } = await ctx.supabase
+-      .from('conversations')
+-      .select(CONVERSATION_SELECT)
+-      .eq('id', id)
+-      .eq('account_id', ctx.accountId)
+-      .maybeSingle();
++    const row = await prisma.conversation.findFirst({
++      where: { id, accountId: ctx.accountId },
++      include: CONVERSATION_INCLUDE,
++    });
++    if (!row) return fail('not_found', 'Conversation not found', 404);
+ 
+-    if (error) {
+-      console.error('[api/v1/conversations] read error:', error);
+-      return fail('internal', 'Failed to read conversation', 500);
+-    }
+-    if (!data) return fail('not_found', 'Conversation not found', 404);
+-
+-    return ok(serializeConversation(normalizeConversation(data as Conversation)));
++    return ok(serializeConversation(prismaToConversation(row)));
+   } catch (err) {
+     return toApiErrorResponse(err);
+   }
+ }
+diff --git a/src/app/api/v1/conversations/route.test.ts b/src/app/api/v1/conversations/route.test.ts
+new file mode 100644
+index 0000000..fb4e474
+--- /dev/null
++++ b/src/app/api/v1/conversations/route.test.ts
+@@ -0,0 +1,242 @@
++import { beforeEach, describe, expect, it, vi } from 'vitest';
++
++const mocks = vi.hoisted(() => ({
++  requireApiKey: vi.fn(),
++  prisma: {
++    conversation: { findMany: vi.fn() },
++  },
++}));
++
++vi.mock('@/lib/auth/api-context', () => ({
++  requireApiKey: mocks.requireApiKey,
++}));
++vi.mock('@/lib/db/prisma', () => ({ prisma: mocks.prisma }));
++
++import { GET } from './route';
++import { encodeCursor } from '@/lib/api/v1/pagination';
++
++const ctx = {
++  accountId: 'acct-1',
++  keyId: 'key-1',
++  scopes: ['conversations:read'],
++  createdBy: null,
++};
++
++function conversationRow(id: string, overrides: Record<string, unknown> = {}) {
++  return {
++    id,
++    accountId: 'acct-1',
++    userId: 'owner-1',
++    contactId: 'ct-1',
++    status: 'open',
++    assignedAgentId: null,
++    lastMessageText: null,
++    lastMessageAt: null,
++    unreadCount: 0,
++    createdAt: new Date('2026-01-01T00:00:00Z'),
++    updatedAt: new Date('2026-01-01T00:00:00Z'),
++    contact: {
++      id: 'ct-1',
++      accountId: 'acct-1',
++      userId: 'owner-1',
++      phone: '+14155550123',
++      phoneNormalized: '14155550123',
++      name: 'Jane',
++      email: null,
++      company: null,
++      avatarUrl: null,
++      createdAt: new Date('2026-01-01T00:00:00Z'),
++      updatedAt: new Date('2026-01-01T00:00:00Z'),
++      contactTags: [],
++    },
++    ...overrides,
++  };
++}
++
++function getRequest(url = 'https://crm.example.com/api/v1/conversations') {
++  return new Request(url);
++}
++
++beforeEach(() => {
++  mocks.requireApiKey.mockReset().mockResolvedValue(ctx);
++});
++
++describe('GET /api/v1/conversations', () => {
++  it('lists conversations scoped to the account', async () => {
++    mocks.prisma.conversation.findMany.mockResolvedValue([
++      conversationRow('conv-1'),
++      conversationRow('conv-2'),
++    ]);
++
++    const response = await GET(getRequest());
++    const body = await response.json();
++
++    expect(response.status).toBe(200);
++    expect(body.data.map((c: { id: string }) => c.id)).toEqual([
++      'conv-1',
++      'conv-2',
++    ]);
++    expect(body.meta.next_cursor).toBeNull();
++    expect(mocks.prisma.conversation.findMany).toHaveBeenCalledWith(
++      expect.objectContaining({
++        where: { accountId: 'acct-1' },
++        include: expect.objectContaining({ contact: expect.any(Object) }),
++        orderBy: [{ createdAt: 'desc' }, { id: 'desc' }],
++      })
++    );
++  });
++
++  it('filters by status and contact_id', async () => {
++    mocks.prisma.conversation.findMany.mockResolvedValue([
++      conversationRow('conv-1'),
++    ]);
++
++    await GET(
++      getRequest(
++        'https://crm.example.com/api/v1/conversations?status=pending&contact_id=ct-9'
++      )
++    );
++
++    expect(mocks.prisma.conversation.findMany).toHaveBeenCalledWith(
++      expect.objectContaining({
++        where: {
++          accountId: 'acct-1',
++          AND: [{ status: 'pending' }, { contactId: 'ct-9' }],
++        },
++      })
++    );
++  });
++
++  it('maps a keyset cursor onto the Prisma where', async () => {
++    mocks.prisma.conversation.findMany.mockResolvedValue([
++      conversationRow('conv-2'),
++    ]);
++    // decodeCursor only trusts server-issued cursors: the id must be a
++    // UUID (see pagination.ts), otherwise the cursor is treated as
++    // absent and the route would query from the first page.
++    const cursorId = 'aaaaaaaa-0000-4000-8000-000000000001';
++    const cursor = encodeCursor({
++      created_at: '2026-01-01T00:00:00Z',
++      id: cursorId,
++    });
++
++    await GET(
++      getRequest(
++        `https://crm.example.com/api/v1/conversations?cursor=${encodeURIComponent(cursor)}`
++      )
++    );
++
++    expect(mocks.prisma.conversation.findMany).toHaveBeenCalledWith(
++      expect.objectContaining({
++        where: {
++          accountId: 'acct-1',
++          AND: [
++            {
++              OR: [
++                { createdAt: { lt: new Date('2026-01-01T00:00:00Z') } },
++                {
++                  AND: [
++                    { createdAt: new Date('2026-01-01T00:00:00Z') },
++                    { id: { lt: cursorId } },
++                  ],
++                },
++              ],
++            },
++          ],
++        },
++      })
++    );
++  });
++
++  it('returns a next_cursor when more rows exist than the limit', async () => {
++    mocks.prisma.conversation.findMany.mockResolvedValue([
++      conversationRow('conv-1'),
++      conversationRow('conv-2'),
++      conversationRow('conv-3'),
++    ]);
++
++    const response = await GET(
++      getRequest('https://crm.example.com/api/v1/conversations?limit=2')
++    );
++    const body = await response.json();
++
++    expect(body.data).toHaveLength(2);
++    expect(body.meta.next_cursor).not.toBeNull();
++    expect(mocks.prisma.conversation.findMany).toHaveBeenCalledWith(
++      expect.objectContaining({ take: 3 })
++    );
++  });
++
++  it('embeds the contact with its tags', async () => {
++    mocks.prisma.conversation.findMany.mockResolvedValue([
++      conversationRow('conv-1', {
++        contact: {
++          id: 'ct-1',
++          accountId: 'acct-1',
++          userId: 'owner-1',
++          phone: '+14155550123',
++          phoneNormalized: '14155550123',
++          name: 'Jane',
++          email: null,
++          company: null,
++          avatarUrl: null,
++          createdAt: new Date('2026-01-01T00:00:00Z'),
++          updatedAt: new Date('2026-01-01T00:00:00Z'),
++          contactTags: [
++            {
++              id: 'cjt-1',
++              contactId: 'ct-1',
++              tagId: 't-1',
++              createdAt: new Date('2026-01-01T00:00:00Z'),
++              tag: {
++                id: 't-1',
++                accountId: 'acct-1',
++                userId: 'owner-1',
++                name: 'vip',
++                color: '#3b82f6',
++                createdAt: new Date('2026-01-01T00:00:00Z'),
++              },
++            },
++          ],
++        },
++      }),
++    ]);
++
++    const response = await GET(getRequest());
++    const body = await response.json();
++
++    expect(body.data[0].contact).toEqual(
++      expect.objectContaining({
++        id: 'ct-1',
++        phone: '+14155550123',
++        name: 'Jane',
++      })
++    );
++    expect(body.data[0].contact.tags).toEqual([
++      { id: 't-1', name: 'vip', color: '#3b82f6' },
++    ]);
++  });
++
++  it('returns an empty list with a null cursor for no rows', async () => {
++    mocks.prisma.conversation.findMany.mockResolvedValue([]);
++
++    const response = await GET(getRequest());
++    const body = await response.json();
++
++    expect(response.status).toBe(200);
++    expect(body.data).toEqual([]);
++    expect(body.meta.next_cursor).toBeNull();
++  });
++
++  it('returns a 500 envelope when the query fails', async () => {
++    mocks.prisma.conversation.findMany.mockRejectedValue(
++      new Error('db down')
++    );
++
++    const response = await GET(getRequest());
++    const body = await response.json();
++
++    expect(response.status).toBe(500);
++    expect(body.error.code).toBe('internal');
++  });
++});
+diff --git a/src/app/api/v1/conversations/route.ts b/src/app/api/v1/conversations/route.ts
+index 56146ca..ef0aa9f 100644
+--- a/src/app/api/v1/conversations/route.ts
++++ b/src/app/api/v1/conversations/route.ts
+@@ -1,66 +1,83 @@
+ // ============================================================
+ // GET /api/v1/conversations ÔÇö list conversations (scope: conversations:read)
+ //
+ // Keyset-paginated (newest first). Filters: `?status=` (open/pending/
+ // closed) and `?contact_id=`. Each conversation embeds its contact +
+-// tags via the shared CONVERSATION_SELECT.
++// tags via the shared CONVERSATION_INCLUDE.
++//
++// Prisma-backed: queries are explicitly scoped by `ctx.accountId`
++// (application-level RLS).
+ // ============================================================
+ 
++import type { Prisma } from '@prisma/client';
++
+ import { requireApiKey } from '@/lib/auth/api-context';
+ import { okList, fail, toApiErrorResponse } from '@/lib/api/v1/respond';
++import { parseListParams, buildPage } from '@/lib/api/v1/pagination';
+ import {
+-  parseListParams,
+-  keysetFilter,
+-  buildPage,
+-} from '@/lib/api/v1/pagination';
+-import {
+-  CONVERSATION_SELECT,
+-  normalizeConversation,
++  CONVERSATION_INCLUDE,
++  prismaToConversation,
+ } from '@/lib/inbox/conversations';
+ import { serializeConversation } from '@/lib/api/v1/conversations';
+-import type { Conversation } from '@/types';
++import type { ConversationStatus } from '@/types';
++import { prisma } from '@/lib/db/prisma';
+ 
+ export async function GET(request: Request) {
+   try {
+     const ctx = await requireApiKey(request, 'conversations:read');
+     const { limit, cursor } = parseListParams(request);
+     const url = new URL(request.url);
+     const status = url.searchParams.get('status');
+     const contactId = url.searchParams.get('contact_id');
+ 
+-    let query = ctx.supabase
+-      .from('conversations')
+-      .select(CONVERSATION_SELECT)
+-      .eq('account_id', ctx.accountId);
++    // Filters and the keyset walk are both OR-groups; combine them with
++    // AND so they never collide in a single `where.OR`.
++    const and: Prisma.ConversationWhereInput[] = [];
+ 
+-    if (status) query = query.eq('status', status);
+-    if (contactId) query = query.eq('contact_id', contactId);
+-
+-    query = query
+-      .order('created_at', { ascending: false })
+-      .order('id', { ascending: false })
+-      .limit(limit + 1);
++    if (status) and.push({ status: status as ConversationStatus });
++    if (contactId) and.push({ contactId });
++    if (cursor) {
++      // Walks *past* the cursor row under a (created_at desc, id desc)
++      // ordering ÔÇö the Prisma equivalent of the PostgREST keyset filter.
++      const at = new Date(cursor.createdAt);
++      and.push({
++        OR: [
++          { createdAt: { lt: at } },
++          { AND: [{ createdAt: at }, { id: { lt: cursor.id } }] },
++        ],
++      });
++    }
+ 
+-    const kf = keysetFilter(cursor);
+-    if (kf) query = query.or(kf);
++    const where: Prisma.ConversationWhereInput = { accountId: ctx.accountId };
++    if (and.length > 0) where.AND = and;
+ 
+-    const { data, error } = await query;
+-    if (error) {
++    let rows;
++    try {
++      rows = await prisma.conversation.findMany({
++        where,
++        include: CONVERSATION_INCLUDE,
++        orderBy: [{ createdAt: 'desc' }, { id: 'desc' }],
++        take: limit + 1,
++      });
++    } catch (error) {
+       console.error('[api/v1/conversations] list error:', error);
+       return fail('internal', 'Failed to list conversations', 500);
+     }
+ 
++    // buildPage expects the `created_at` ISO string the old PostgREST
++    // rows carried; feed it a projection, then serialize the originals.
+     const { items, nextCursor } = buildPage(
+-      (data ?? []) as Array<{ created_at: string; id: string }>,
++      rows.map((r) => ({ created_at: r.createdAt.toISOString(), id: r.id })),
+       limit
+     );
++    const byId = new Map(rows.map((r) => [r.id, r]));
+     return okList(
+       items.map((r) =>
+-        serializeConversation(normalizeConversation(r as Conversation))
++        serializeConversation(prismaToConversation(byId.get(r.id)!))
+       ),
+       nextCursor
+     );
+   } catch (err) {
+     return toApiErrorResponse(err);
+   }
+ }

@@ -47,43 +47,33 @@ export default function NotificationsPage() {
     load();
   }, [load]);
 
-  // Realtime — new assignments appear without a refresh, and a
-  // "mark all read" fired from another tab/device stays in sync here.
+  // Poll for notification changes every 5 seconds instead of using
+  // Supabase Realtime. Keeps the list in sync across tabs/devices.
   useEffect(() => {
-    const supabase = createClient();
-    const channel = supabase
-      .channel("notifications-page")
-      .on(
-        "postgres_changes",
-        { event: "*", schema: "public", table: "notifications" },
-        (payload) => {
-          if (payload.eventType === "INSERT") {
-            const row = payload.new as Notification;
-            setNotifications((prev) => {
-              if (!prev) return [row];
-              if (prev.some((n) => n.id === row.id)) return prev;
-              return [row, ...prev];
-            });
-          } else if (payload.eventType === "UPDATE") {
-            const row = payload.new as Notification;
-            setNotifications((prev) =>
-              prev?.map((n) => (n.id === row.id ? { ...n, ...row } : n)) ??
-              prev,
-            );
-          } else if (payload.eventType === "DELETE") {
-            const oldRow = payload.old as Partial<Notification>;
-            setNotifications(
-              (prev) => prev?.filter((n) => n.id !== oldRow.id) ?? prev,
-            );
-          }
-        },
-      )
-      .subscribe();
+    let cancelled = false;
+
+    const pollNotifications = async () => {
+      try {
+        const res = await fetch(
+          `/api/data/notifications?select=*&account_id=eq.${accountId}&order=created_at.desc&limit=100`
+        );
+        if (!res.ok || cancelled) return;
+        const rows = (await res.json()) as Notification[];
+        if (cancelled) return;
+        setNotifications(rows);
+      } catch {
+        // Network error — skip this tick.
+      }
+    };
+
+    pollNotifications();
+    const id = setInterval(pollNotifications, 5_000);
 
     return () => {
-      supabase.removeChannel(channel);
+      cancelled = true;
+      clearInterval(id);
     };
-  }, []);
+  }, [accountId]);
 
   const markRead = useCallback(
     async (id: string) => {
