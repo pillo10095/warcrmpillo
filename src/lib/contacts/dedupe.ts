@@ -1,5 +1,4 @@
-import { prisma } from "@/lib/db/prisma";
-import { normalizePhone, phonesMatch } from "@/lib/whatsapp/phone-utils";
+import { normalizePhone } from "@/lib/whatsapp/phone-utils";
 
 /**
  * Contact de-duplication helpers, shared by the WhatsApp webhook, the
@@ -12,10 +11,10 @@ import { normalizePhone, phonesMatch } from "@/lib/whatsapp/phone-utils";
  * tolerance (last-8-digit match) for the softer "possible duplicate"
  * surfaces.
  *
- * Prisma-backed (Task B): the client argument is kept on the public
- * signatures so not-yet-migrated callers (webhook, resolve-conversation,
- * client components) keep compiling; the queries hit `prisma` directly
- * and are explicitly scoped by `accountId` (application-level RLS).
+ * This module is BROWSER-SAFE (client components import it): it only
+ * contains pure helpers and performs no I/O. The Prisma-backed
+ * `findExistingContact` lives in `./duplicate-lookup` (server-only) so
+ * the client bundle never pulls in Prisma.
  */
 
 /** Canonical de-dup key for a phone string (digits only). */
@@ -29,30 +28,6 @@ export interface ExistingContact {
   phone: string;
   name?: string | null;
   [key: string]: unknown;
-}
-
-/**
- * Find an existing contact in `accountId` whose phone matches `phone`,
- * or null. Pre-filters in SQL by the last-8-digit suffix (so we don't
- * pull every contact), then applies the strict `phonesMatch` in JS on
- * the small candidate set — the exact approach the webhook has used.
- */
-export async function findExistingContact(
-  _db: unknown,
-  accountId: string,
-  phone: string,
-): Promise<ExistingContact | null> {
-  const normalized = normalizePhone(phone);
-  if (!normalized) return null;
-
-  const suffix = normalized.length >= 8 ? normalized.slice(-8) : normalized;
-
-  const rows = await prisma.contact.findMany({
-    where: { accountId, phone: { endsWith: suffix } },
-    select: { id: true, phone: true, name: true },
-  });
-
-  return rows.find((c) => phonesMatch(c.phone, phone)) ?? null;
 }
 
 /**

@@ -1,5 +1,5 @@
 import { describe, it, expect, vi } from 'vitest';
-import type { SupabaseClient } from '@supabase/supabase-js';
+import type { SupabaseQueryBuilder } from '@/lib/supabase/query-builder';
 import { createBroadcast, BroadcastError } from './broadcast-core';
 
 // Contact resolution and token decryption are exercised elsewhere — stub
@@ -13,7 +13,7 @@ vi.mock('@/lib/api/v1/contacts', () => ({
 
 // These assertions all fire in the pure validation prologue, before
 // any Supabase call — a bare stub is enough.
-const db = {} as SupabaseClient;
+const db = {} as SupabaseQueryBuilder;
 
 describe('createBroadcast validation', () => {
   it('rejects a missing template_name', async () => {
@@ -94,7 +94,7 @@ function makeDb(rpcResult: { data: unknown; error: unknown }) {
       calls.rpc.push({ name, args });
       return Promise.resolve(rpcResult);
     },
-  } as unknown as SupabaseClient;
+  } as unknown as SupabaseQueryBuilder;
   return { db: database, calls };
 }
 

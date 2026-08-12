@@ -7,7 +7,6 @@ import { addContactTag, deleteContactTag } from '@/lib/contacts/tag-api';
 import { toast } from 'sonner';
 import type { Contact, Tag, ContactTag } from '@/types';
 import {
-  findExistingContact,
   isExactMatch,
   isUniqueViolation,
   type ExistingContact,
@@ -83,7 +82,24 @@ export function ContactForm({
   }, [open, contact]);
 
   // Look up an existing contact with this number (new contacts only).
-  // Runs on blur so we don't query on every keystroke.
+  // Runs on blur so we don't query on every keystroke. The lookup goes
+  // through /api/contacts/duplicate because the Prisma-backed dedupe
+  // helper is server-only — importing it here would pull Prisma into
+  // the client bundle.
+  async function lookupExistingContact(
+    accountId: string,
+    phone: string,
+  ): Promise<ExistingContact | null> {
+    const res = await fetch(
+      `/api/contacts/duplicate?phone=${encodeURIComponent(phone)}`,
+    );
+    if (!res.ok) return null;
+    const body = (await res.json().catch(() => null)) as {
+      contact?: ExistingContact | null;
+    } | null;
+    return body?.contact ?? null;
+  }
+
   async function checkDuplicate() {
     if (isEdit || !accountId) return;
     const value = phone.trim();
@@ -93,7 +109,7 @@ export function ContactForm({
     }
     setCheckingDup(true);
     try {
-      const existing = await findExistingContact(supabase, accountId, value);
+      const existing = await lookupExistingContact(accountId, value);
       setDupMatch(
         existing
           ? { contact: existing, exact: isExactMatch(existing, value) }
@@ -204,8 +220,7 @@ export function ContactForm({
       if (isUniqueViolation(err)) {
         toast.error(t('toastConflict'));
         if (!isEdit && accountId) {
-          const existing = await findExistingContact(
-            supabase,
+          const existing = await lookupExistingContact(
             accountId,
             phone.trim(),
           );

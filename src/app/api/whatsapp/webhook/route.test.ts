@@ -126,12 +126,14 @@ vi.mock('@/lib/whatsapp/meta-api', () => ({
   getMediaUrl: vi.fn(),
   downloadMedia: vi.fn(),
 }))
-vi.mock('@/lib/contacts/dedupe', () => ({
+vi.mock('@/lib/contacts/duplicate-lookup', () => ({
   findExistingContact: vi.fn(async () => ({
     id: 'contact-1',
     name: 'Ada',
     phone: '15551230000',
   })),
+}))
+vi.mock('@/lib/contacts/dedupe', () => ({
   isUniqueViolation: () => false,
 }))
 vi.mock('@/lib/whatsapp/webhook-signature', () => ({

@@ -27,7 +27,8 @@
 
 import { prisma } from '@/lib/db/prisma';
 
-import { findExistingContact, isUniqueViolation } from '@/lib/contacts/dedupe';
+import { findExistingContact } from '@/lib/contacts/duplicate-lookup';
+import { isUniqueViolation } from '@/lib/contacts/dedupe';
 import { sanitizePhoneForMeta, isValidE164 } from '@/lib/whatsapp/phone-utils';
 import { SendMessageError } from '@/lib/whatsapp/send-message';
 import { resolveAuditUserId, ContactError } from '@/lib/api/v1/contacts';
