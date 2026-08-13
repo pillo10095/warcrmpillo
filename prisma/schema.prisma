@@ -53,6 +53,7 @@ model Account {
   tags              Tag[]
   conversations     Conversation[]
   whatsappConfigs   WhatsAppConfig[]
+  openwaConfigs     OpenWAConfig[]
   messageTemplates  MessageTemplate[]
   broadcasts        Broadcast[]
   notifications     Notification[]
@@ -225,6 +226,7 @@ model Conversation {
   accountId           String             @map("account_id") @db.VarChar(36)
   userId              String             @map("user_id") @db.VarChar(36)
   contactId           String             @map("contact_id") @db.VarChar(36)
+  provider            String             @default("meta") @db.VarChar(20)
   status              ConversationStatus @default(open)
   assignedAgentId     String?            @map("assigned_agent_id") @db.VarChar(36)
   lastMessageText     String?            @map("last_message_text") @db.Text
@@ -243,7 +245,7 @@ model Conversation {
   messageReactions MessageReaction[]
   flowRuns         FlowRun[]
 
-  @@unique([accountId, contactId])
+  @@unique([accountId, contactId, provider])
   @@index([contactId])
   @@map("conversations")
 }
@@ -253,6 +255,7 @@ model Message {
   conversationId     String        @map("conversation_id") @db.VarChar(36)
   senderType         SenderType    @map("sender_type")
   senderId           String?       @map("sender_id") @db.VarChar(36)
+  provider           String        @default("meta") @db.VarChar(20)
   contentType        ContentType   @default(text) @map("content_type")
   contentText        String?       @map("content_text") @db.Text
   mediaUrl           String?       @map("media_url") @db.Text
@@ -296,6 +299,40 @@ model WhatsAppConfig {
   account Account @relation(fields: [accountId], references: [id], onDelete: Cascade)
 
   @@map("whatsapp_config")
+}
+
+model OpenWAConfig {
+  id          String    @id @default(uuid()) @db.VarChar(36)
+  accountId   String    @unique @map("account_id") @db.VarChar(36)
+  apiUrl      String    @default("http://localhost:2785/api") @map("api_url") @db.VarChar(512)
+  apiKey      String    @map("api_key") @db.Text
+  status      String    @default("disconnected") @db.VarChar(20)
+  connectedAt DateTime? @map("connected_at") @db.DateTime(3)
+  createdAt   DateTime  @default(now()) @map("created_at") @db.DateTime(3)
+  updatedAt   DateTime  @updatedAt @map("updated_at") @db.DateTime(3)
+
+  account  Account          @relation(fields: [accountId], references: [id], onDelete: Cascade)
+  sessions OpenWASession[]
+
+  @@map("openwa_configs")
+}
+
+model OpenWASession {
+  id              String   @id @default(uuid()) @db.VarChar(36)
+  configId        String   @map("config_id") @db.VarChar(36)
+  openwaSessionId String   @unique @map("openwa_session_id") @db.VarChar(64)
+  name            String   @db.VarChar(100)
+  phone           String?  @db.VarChar(32)
+  pushName        String?  @map("push_name") @db.VarChar(255)
+  status          String   @default("created") @db.VarChar(20)
+  engineType      String   @default("baileys") @map("engine_type") @db.VarChar(20)
+  createdAt       DateTime @default(now()) @map("created_at") @db.DateTime(3)
+  updatedAt       DateTime @updatedAt @map("updated_at") @db.DateTime(3)
+
+  config OpenWAConfig @relation(fields: [configId], references: [id], onDelete: Cascade)
+
+  @@index([configId])
+  @@map("openwa_sessions")
 }
 
 model MessageTemplate {
