@@ -48,6 +48,7 @@ import { prisma } from '@/lib/db/prisma';
 import type { MessageTemplate } from '@/types';
 import { isMessageTemplate } from '@/lib/whatsapp/template-row-guard';
 import { prismaTemplateToMessage } from '@/lib/whatsapp/template-row-mapper';
+import { resolveOpenWAProvider } from '@/lib/whatsapp/providers';
 
 export const MEDIA_KINDS = ['image', 'video', 'document', 'audio'] as const;
 export const VALID_MESSAGE_TYPES = [
@@ -231,6 +232,8 @@ export async function sendMessageToConversation(
     throw new SendMessageError('not_found', 'Conversation not found', 404);
   }
 
+  const provider = conversation.provider ?? 'meta';
+
   const contact = conversation.contact;
   if (!contact?.phone) {
     throw new SendMessageError(
@@ -392,11 +395,47 @@ export async function sendMessageToConversation(
     return result.messageId;
   };
 
-  // Send via Meta — retry across phone-number variants if Meta rejects
-  // with "recipient not in allowed list"; persist a working variant
-  // back to the contact so the next send goes straight through.
+  // Send via the conversation's provider. Meta gets the phone-variant
+  // retry; OpenWA sends directly (Baileys keys chats by digit phone).
   let waMessageId = '';
   let workingPhone = sanitizedPhone;
+
+  if (provider === 'openwa') {
+    if (messageType === 'template' || messageType === 'interactive') {
+      throw new SendMessageError(
+        'unsupported_for_provider',
+        `Message type "${messageType}" is only supported on the Meta line`,
+        400
+      );
+    }
+    try {
+      const openwa = await resolveOpenWAProvider(accountId);
+      if (isMediaKind) {
+        const result = await openwa.sendMedia(sanitizedPhone, {
+          type: messageType as 'image' | 'video' | 'document' | 'audio',
+          url: mediaUrl!,
+          caption: contentText || undefined,
+          filename: filename || undefined,
+        });
+        waMessageId = result.providerMessageId;
+      } else if (messageType === 'text') {
+        const result = await openwa.sendText(sanitizedPhone, contentText!);
+        waMessageId = result.providerMessageId;
+      } else {
+        throw new SendMessageError(
+          'bad_request',
+          `Unsupported message_type "${messageType}"`,
+          400
+        );
+      }
+    } catch (err) {
+      if (err instanceof SendMessageError) throw err;
+      const message =
+        err instanceof Error ? err.message : 'Unknown OpenWA API error';
+      console.error('[send-message] OpenWA send failed:', message);
+      throw new SendMessageError('openwa_error', `OpenWA error: ${message}`, 502);
+    }
+  } else {
   try {
     const variants = phoneVariants(sanitizedPhone);
     let lastError: unknown = null;
@@ -426,6 +465,7 @@ export async function sendMessageToConversation(
     console.error('[send-message] Meta send failed for all variants:', message);
     throw new SendMessageError('meta_error', `Meta API error: ${message}`, 502);
   }
+  }
 
   if (workingPhone !== sanitizedPhone) {
     console.log(
@@ -451,6 +491,7 @@ export async function sendMessageToConversation(
       data: {
         conversationId,
         senderType: 'agent',
+        provider,
         contentType: messageType as ContentType,
         contentText: interactiveBody ?? contentText ?? null,
         mediaUrl: mediaUrl || null,

@@ -15,6 +15,11 @@ const mocks = vi.hoisted(() => ({
   sendInteractiveButtons: vi.fn(),
   sendInteractiveList: vi.fn(),
   pauseActiveFlowRuns: vi.fn(),
+  resolveOpenWAProvider: vi.fn(),
+  openwaProvider: {
+    sendText: vi.fn(),
+    sendMedia: vi.fn(),
+  },
 }));
 
 vi.mock('@/lib/db/prisma', () => ({ prisma: mocks.prisma }));
@@ -38,6 +43,9 @@ vi.mock('@/lib/whatsapp/meta-api', () => ({
 }));
 vi.mock('@/lib/flows/pause-on-agent-send', () => ({
   pauseActiveFlowRuns: mocks.pauseActiveFlowRuns,
+}));
+vi.mock('@/lib/whatsapp/providers', () => ({
+  resolveOpenWAProvider: mocks.resolveOpenWAProvider,
 }));
 
 import {
@@ -118,6 +126,17 @@ beforeEach(() => {
   mocks.sendInteractiveButtons.mockResolvedValue({ messageId: 'wamid-1' });
   mocks.sendInteractiveList.mockResolvedValue({ messageId: 'wamid-1' });
   mocks.pauseActiveFlowRuns.mockResolvedValue(undefined);
+  mocks.resolveOpenWAProvider.mockResolvedValue(mocks.openwaProvider);
+  mocks.openwaProvider.sendText.mockResolvedValue({
+    messageId: 'owa-msg-1',
+    providerMessageId: 'owa-msg-1',
+    timestamp: 1719306115,
+  });
+  mocks.openwaProvider.sendMedia.mockResolvedValue({
+    messageId: 'owa-msg-2',
+    providerMessageId: 'owa-msg-2',
+    timestamp: 1719306115,
+  });
 });
 
 async function expectSendError(
@@ -438,6 +457,7 @@ describe('sendMessageToConversation — success path', () => {
       data: {
         conversationId: 'cv-1',
         senderType: 'agent',
+        provider: 'meta',
         contentType: 'text',
         contentText: 'Hello there',
         mediaUrl: null,
@@ -492,6 +512,84 @@ describe('sendMessageToConversation — success path', () => {
       })
     ).rejects.toMatchObject({ code: 'db_error', status: 500 });
     expect(mocks.sendTextMessage).toHaveBeenCalled();
+  });
+});
+
+describe('sendMessageToConversation — OpenWA line', () => {
+  beforeEach(() => {
+    mocks.prisma.conversation.findFirst.mockResolvedValue(
+      conversationRow({ provider: 'openwa' })
+    );
+  });
+
+  it('sends text via OpenWA and persists provider + providerMessageId', async () => {
+    const result = await sendMessageToConversation(undefined, ACCOUNT_ID, {
+      conversationId: 'cv-1',
+      messageType: 'text',
+      contentText: 'Hola gratis',
+    });
+
+    expect(mocks.resolveOpenWAProvider).toHaveBeenCalledWith(ACCOUNT_ID);
+    expect(mocks.openwaProvider.sendText).toHaveBeenCalledWith(
+      '14155550123',
+      'Hola gratis'
+    );
+    expect(mocks.sendTextMessage).not.toHaveBeenCalled();
+    expect(result).toEqual({ messageId: 'msg-1', whatsappMessageId: 'owa-msg-1' });
+    expect(mocks.prisma.message.create).toHaveBeenCalledWith({
+      data: expect.objectContaining({
+        provider: 'openwa',
+        messageId: 'owa-msg-1',
+        contentType: 'text',
+      }),
+    });
+  });
+
+  it('sends media via OpenWA using the flat DTO payload', async () => {
+    await sendMessageToConversation(undefined, ACCOUNT_ID, {
+      conversationId: 'cv-1',
+      messageType: 'image',
+      mediaUrl: 'https://cdn.example.com/foto.jpg',
+      contentText: 'mira esto',
+    });
+
+    expect(mocks.openwaProvider.sendMedia).toHaveBeenCalledWith(
+      '14155550123',
+      { type: 'image', url: 'https://cdn.example.com/foto.jpg', caption: 'mira esto' }
+    );
+  });
+
+  it('rejects template and interactive types on the OpenWA line', async () => {
+    await expectSendError(
+      { conversationId: 'cv-1', messageType: 'template', templateName: 'x' },
+      400,
+      /only supported on the Meta line/
+    );
+    await expectSendError(
+      {
+        conversationId: 'cv-1',
+        messageType: 'interactive',
+        interactivePayload: {
+          kind: 'buttons',
+          body: 'Pick one',
+          buttons: [{ id: 'a', title: 'A' }],
+        },
+      },
+      400,
+      /only supported on the Meta line/
+    );
+  });
+
+  it('maps an OpenWA gateway error to openwa_error/502', async () => {
+    mocks.openwaProvider.sendText.mockRejectedValue(new Error('ECONNREFUSED'));
+
+    await expect(
+      sendMessageToConversation(undefined, ACCOUNT_ID, {
+        conversationId: 'cv-1',
+        messageType: 'text',
+        contentText: 'hi',
+      })
+    ).rejects.toMatchObject({ code: 'openwa_error', status: 502 });
   });
 });
 
