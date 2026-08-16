@@ -19,6 +19,8 @@ import { NextResponse, after } from 'next/server';
 import { prisma } from '@/lib/db/prisma';
 import { verifyOpenWAWebhookSignature } from '@/lib/whatsapp/openwa-signature';
 import { normalizePhone } from '@/lib/whatsapp/phone-utils';
+import { decrypt } from '@/lib/whatsapp/encryption';
+import { OpenWAProvider } from '@/lib/whatsapp/providers/openwa-provider';
 import { findExistingContact } from '@/lib/contacts/duplicate-lookup';
 import { isUniqueViolation } from '@/lib/contacts/dedupe';
 import { reopenClosedConversation } from '@/lib/conversations/reopen';
@@ -79,10 +81,19 @@ export async function POST(request: Request) {
   const accountId = session.config.accountId;
   const ownerUserId = session.config.account.ownerUserId;
 
+  // Build the gateway client for THIS delivery's session (not the
+  // account's "ready" default) so LID→phone resolution hits the right
+  // session even when a delivery arrives from a non-ready one.
+  const provider = new OpenWAProvider({
+    apiUrl: session.config.apiUrl,
+    apiKey: decrypt(session.config.apiKey),
+    sessionId: session.openwaSessionId,
+  });
+
   // Ack early; heavy processing runs after the response.
   after(async () => {
     try {
-      await handleEvent(delivery, accountId, ownerUserId, session.openwaSessionId);
+      await handleEvent(delivery, accountId, ownerUserId, session.openwaSessionId, provider);
     } catch (err) {
       console.error('[openwa/webhook] event processing failed:', err);
     }
@@ -95,11 +106,12 @@ async function handleEvent(
   delivery: OpenWADelivery,
   accountId: string,
   ownerUserId: string,
-  openwaSessionId: string
+  openwaSessionId: string,
+  provider: OpenWAProvider
 ): Promise<void> {
   switch (delivery.event) {
     case 'message.received':
-      await handleInboundMessage(delivery, accountId, ownerUserId);
+      await handleInboundMessage(delivery, accountId, ownerUserId, provider);
       break;
     case 'message.ack':
     case 'message.failed':
@@ -141,7 +153,8 @@ function messageTypeToContentType(type: string): ContentType {
 async function handleInboundMessage(
   delivery: OpenWADelivery,
   accountId: string,
-  ownerUserId: string
+  ownerUserId: string,
+  provider: OpenWAProvider
 ): Promise<void> {
   const data = delivery.data as {
     id?: string;
@@ -168,7 +181,23 @@ async function handleInboundMessage(
     return;
   }
 
-  const phone = normalizePhone(data.from ?? '');
+  // Resolve the sender's phone. The gateway delivers `from` as a full JID —
+  // either `<number>@c.us` or, increasingly, `<lid>@lid` (WhatsApp's privacy
+  // ids). Storing a LID's digits as the contact phone is a bug: the LID is
+  // NOT a number, and a later send to `${lid}@c.us` fails. So for `@lid`
+  // senders we ask the gateway to resolve the real MSISDN; when it cannot
+  // (unmapped contact) we keep the full JID so outbound sends can target
+  // `@lid` directly.
+  const rawFrom = data.from ?? '';
+  let phone = normalizePhone(rawFrom);
+  if (rawFrom.includes('@lid')) {
+    const resolved = await provider.resolvePhone(rawFrom);
+    if (resolved) {
+      phone = resolved;
+    } else {
+      phone = rawFrom;
+    }
+  }
   if (!phone) {
     console.warn(
       `[openwa/webhook] inbound message "${messageId}" has no parsable sender, skipping`
@@ -196,7 +225,6 @@ async function handleInboundMessage(
           accountId,
           userId: ownerUserId,
           phone,
-          phoneNormalized: phone,
           name: contactName,
         },
         select: { id: true, name: true, phone: true },

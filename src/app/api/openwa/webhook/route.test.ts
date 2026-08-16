@@ -196,7 +196,7 @@ describe('POST /api/openwa/webhook â€” inbound message', () => {
     }));
 
     expect(h.prisma.contact.create).toHaveBeenCalledWith({
-      data: expect.objectContaining({ accountId: ACCOUNT_ID, phoneNormalized: '15551230000' }),
+      data: expect.objectContaining({ accountId: ACCOUNT_ID, phone: '15551230000' }),
       select: { id: true, name: true, phone: true },
     });
     expect(h.prisma.conversation.create).toHaveBeenCalledWith({
