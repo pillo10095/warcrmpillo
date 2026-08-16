@@ -6,6 +6,8 @@ import { SESSION_COOKIE } from "@/lib/auth/cookies";
 import {
   buildDataQuery,
   toPrismaModel,
+  toWireShape,
+  snakeToCamel,
   ok,
   err,
 } from "@/lib/api/data/query-builder";
@@ -16,7 +18,6 @@ export const runtime = "nodejs";
 const ACCOUNT_SCOPED = new Set([
   "contacts",
   "tags",
-  "contact_tags",
   "conversations",
   "whatsapp_config",
   "message_templates",
@@ -33,7 +34,6 @@ const ACCOUNT_SCOPED = new Set([
   "ai_knowledge_documents",
   "ai_knowledge_chunks",
   "ai_usage_logs",
-  "message_reactions",
 ]);
 
 // Tables scoped by user_id (the user's own data)
@@ -56,6 +56,16 @@ const USER_SCOPED = new Set([
 // through a parent relation (e.g. pipeline_stages → pipeline → user)
 const RELATIONALLY_SCOPED: Record<string, { relation: string; parentField: string }> = {
   pipeline_stages: { relation: "pipeline", parentField: "userId" },
+  // message_reactions has no account_id column — scope through its
+  // conversation relation instead (conversation_id → conversation.account_id).
+  message_reactions: { relation: "conversation", parentField: "accountId" },
+  // contact_tags has no account_id column either — scope through
+  // contact → account (contact_tags → contact.account_id).
+  contact_tags: { relation: "contact", parentField: "accountId" },
+  // openwa_sessions has no account_id — scope through its config.
+  openwa_sessions: { relation: "config", parentField: "accountId" },
+  // openwa_configs has no account_id — scope through its account relation.
+  openwa_configs: { relation: "account", parentField: "accountId" },
 };
 
 // Tables that are NOT scoped (system / cross-account)
@@ -83,8 +93,27 @@ export async function GET(
   const user = await authenticate();
   if (!user) return err("Unauthorized", 401);
 
-  const { where, orderBy, select, take, skip, countOnly, headOnly } =
+  const { where, orderBy, select, include, take, skip, countOnly, headOnly } =
     buildDataQuery(table, request.nextUrl.searchParams);
+
+  // The client query-builder sends `.limit(n)` / `.range(a,b)` as an
+  // HTTP `Range: a-b` header (PostgREST convention), while `buildDataQuery`
+  // reads `limit`/`offset` query params. Honor the header too so page
+  // sizes are actually applied.
+  const rangeHeader = request.headers.get("range");
+  let effectiveTake = take;
+  let effectiveSkip = skip;
+  if (rangeHeader) {
+    const m = rangeHeader.match(/^(\d+)-(\d+)$/);
+    if (m) {
+      const from = parseInt(m[1], 10);
+      const to = parseInt(m[2], 10);
+      if (Number.isFinite(from) && Number.isFinite(to) && to >= from) {
+        effectiveSkip = from;
+        effectiveTake = Math.min(to - from + 1, 1000);
+      }
+    }
+  }
 
   // Apply tenant scoping
   if (ACCOUNT_SCOPED.has(table)) {
@@ -93,7 +122,8 @@ export async function GET(
     where.userId = user.userId;
   } else if (RELATIONALLY_SCOPED[table]) {
     const { relation, parentField } = RELATIONALLY_SCOPED[table];
-    where[relation] = { [parentField]: user.userId };
+    // parentField is either "accountId" or "userId" on the parent model.
+    where[relation] = { [parentField]: parentField === "accountId" ? user.accountId : user.userId };
   }
 
   try {
@@ -103,20 +133,21 @@ export async function GET(
     // Count-only query
     if (countOnly || headOnly) {
       const count = await prismaModel.count({ where });
-      return ok([], count);
+      return ok([], count, count);
     }
 
     const query: Record<string, unknown> = { where, orderBy };
     if (select) query.select = select;
-    if (take !== undefined) query.take = take;
-    if (skip !== undefined) query.skip = skip;
+    if (include) query.include = include;
+    if (effectiveTake !== undefined) query.take = effectiveTake;
+    if (effectiveSkip !== undefined) query.skip = effectiveSkip;
 
     const rows = await prismaModel.findMany(query);
-    const count = (take !== undefined || skip !== undefined)
+    const count = (effectiveTake !== undefined || effectiveSkip !== undefined)
       ? await prismaModel.count({ where })
       : undefined;
 
-    return ok(rows, count);
+    return ok(toWireShape(rows), count);
   } catch (e: any) {
     return err(e.message ?? "Query failed", 500);
   }
@@ -145,6 +176,18 @@ export async function POST(
     const isArray = Array.isArray(body);
     const items = isArray ? body : [body];
 
+    // Convert snake_case wire keys → Prisma camelCase fields
+    // (e.g. `phone_normalized` → `phoneNormalized`).
+    for (const item of items) {
+      for (const key of Object.keys(item)) {
+        const camel = snakeToCamel(key);
+        if (camel !== key) {
+          item[camel] = item[key];
+          delete item[key];
+        }
+      }
+    }
+
     // Inject tenant scope
     for (const item of items) {
       if (ACCOUNT_SCOPED.has(table)) {
@@ -166,11 +209,11 @@ export async function POST(
         return ok([], result.count);
       } else {
         // Return the created row directly from create()
-        return ok(result);
+        return ok(toWireShape(result));
       }
     }
 
-    return ok(result, isArray ? result.count : undefined);
+    return ok(toWireShape(result), isArray ? result.count : undefined);
   } catch (e: any) {
     return err(e.message ?? "Insert failed", 500);
   }
@@ -199,6 +242,9 @@ export async function PATCH(
     filterWhere.accountId = user.accountId;
   } else if (USER_SCOPED.has(table)) {
     filterWhere.userId = user.userId;
+  } else if (RELATIONALLY_SCOPED[table]) {
+    const { relation, parentField } = RELATIONALLY_SCOPED[table];
+    filterWhere[relation] = { [parentField]: parentField === "accountId" ? user.accountId : user.userId };
   }
 
   try {
@@ -210,6 +256,16 @@ export async function PATCH(
     if (ACCOUNT_SCOPED.has(table)) delete data.accountId;
     if (USER_SCOPED.has(table)) delete data.userId;
     delete data.id; // never allow PK override
+
+    // Convert snake_case wire keys → Prisma camelCase fields
+    // (e.g. `unread_count` → `unreadCount`, `read_at` → `readAt`).
+    for (const key of Object.keys(data)) {
+      const camel = snakeToCamel(key);
+      if (camel !== key) {
+        data[camel] = data[key];
+        delete data[key];
+      }
+    }
 
     const result = await prismaModel.updateMany({
       where: filterWhere,
@@ -242,6 +298,9 @@ export async function DELETE(
     filterWhere.accountId = user.accountId;
   } else if (USER_SCOPED.has(table)) {
     filterWhere.userId = user.userId;
+  } else if (RELATIONALLY_SCOPED[table]) {
+    const { relation, parentField } = RELATIONALLY_SCOPED[table];
+    filterWhere[relation] = { [parentField]: parentField === "accountId" ? user.accountId : user.userId };
   }
 
   try {

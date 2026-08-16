@@ -41,12 +41,14 @@ export const TABLE_MODEL_MAP: Record<string, string> = {
   flow_nodes: "flowNode",
   flow_runs: "flowRun",
   flow_run_events: "flowRunEvent",
+  openwa_configs: "openWAConfig",
+  openwa_sessions: "openWASession",
 };
 
 // ── Column name → Prisma field mapping (snake_case → camelCase) ──
 // Built dynamically from table name patterns; covers the common
 // `account_id` → `accountId` style mapping.
-function snakeToCamel(s: string): string {
+export function snakeToCamel(s: string): string {
   return s.replace(/_([a-z])/g, (_, c) => c.toUpperCase());
 }
 
@@ -423,6 +425,7 @@ type FilterOp =
   | { type: "isNull"; field: string };
 
 const FILTER_RE = /^(.+)\.(eq|neq|gt|gte|lt|lte|in|like|ilike|is)$/;
+const VALUE_FILTER_RE = /^(eq|neq|gt|gte|lt|lte|in|like|ilike|is)\.([\s\S]*)$/;
 
 export function parseFilters(
   table: string,
@@ -430,59 +433,179 @@ export function parseFilters(
 ): Record<string, unknown> {
   const where: Record<string, unknown> = {};
   for (const [key, rawValue] of searchParams.entries()) {
-    const m = key.match(FILTER_RE);
-    if (!m) continue;
-    const [, rawCol, op] = m;
+    let rawCol: string;
+    let op: string;
+    let value: string;
+
+    // PostgREST-style `col=eq.value` — the form the client query-builder
+    // serializes (`?col=eq.v`). Also accept the alternate `col.eq=value`.
+    const keyMatch = key.match(FILTER_RE);
+    if (keyMatch) {
+      [, rawCol, op] = keyMatch;
+      value = rawValue;
+    } else {
+      const valMatch = rawValue.match(VALUE_FILTER_RE);
+      if (!valMatch) continue;
+      rawCol = key;
+      [, op, value] = valMatch;
+    }
+
     const field = toPrismaField(table, rawCol);
     if (!field) continue;
 
     switch (op) {
       case "eq":
-        where[field] = castValue(rawValue);
+        where[field] = castValue(value);
         break;
       case "neq":
-        where[field] = { not: castValue(rawValue) };
+        where[field] = { not: castValue(value) };
         break;
       case "gt":
-        where[field] = { gt: castValue(rawValue) };
+        where[field] = { gt: castValue(value) };
         break;
       case "gte":
-        where[field] = { gte: castValue(rawValue) };
+        where[field] = { gte: castValue(value) };
         break;
       case "lt":
-        where[field] = { lt: castValue(rawValue) };
+        where[field] = { lt: castValue(value) };
         break;
       case "lte":
-        where[field] = { lte: castValue(rawValue) };
+        where[field] = { lte: castValue(value) };
         break;
-      case "in":
-        where[field] = { in: rawValue.split(",").map(castValue) };
+      case "in": {
+        const inner = value.trim().startsWith("(") && value.trim().endsWith(")")
+          ? value.trim().slice(1, -1)
+          : value;
+        where[field] = { in: inner.split(",").map(castValue) };
         break;
+      }
       case "like":
-        where[field] = { like: rawValue };
+      case "ilike": {
+        // Prisma (MySQL) has no like/ilike operators. Translate the
+        // PostgREST `%wildcard%` pattern to contains/startsWith/endsWith;
+        // MySQL collations are case-insensitive by default, so like === ilike.
+        const startsWild = value.startsWith("%");
+        const endsWild = value.endsWith("%");
+        const core = value.replace(/^%/, "").replace(/%$/, "");
+        if (startsWild && endsWild) where[field] = { contains: core };
+        else if (endsWild) where[field] = { startsWith: core };
+        else if (startsWild) where[field] = { endsWith: core };
+        else where[field] = { equals: core };
         break;
-      case "ilike":
-        where[field] = { contains: rawValue, mode: "insensitive" as const };
-        break;
+      }
       case "is":
-        if (rawValue === "null") where[field] = null;
+        if (value === "null") where[field] = null;
         break;
     }
   }
   return where;
 }
 
+// ── Default orderBy per table (when no `order` param is given) ────
+// Most tables have `createdAt`; tables without it need a fallback that
+// actually exists on the model.
+const DEFAULT_ORDER_BY: Record<string, Record<string, string>[]> = {
+  member_presence: [{ lastSeenAt: "desc" }],
+};
+
 /** Parse `order=col.asc,col2.desc` into Prisma orderBy. */
 export function parseOrderBy(
   table: string,
   orderParam: string | null,
 ): Record<string, string>[] {
-  if (!orderParam) return [{ createdAt: "desc" }]; // default
+  if (!orderParam) {
+    return DEFAULT_ORDER_BY[table] ?? [{ createdAt: "desc" }]; // default
+  }
   return orderParam.split(",").map((part) => {
     const [rawCol, dir] = part.split(".");
     const field = toPrismaField(table, rawCol);
     return { [field]: dir === "asc" ? "asc" : "desc" };
   });
+}
+
+// ── Nested select parsing (PostgREST → Prisma include) ───────────
+// The Inbox fetches conversations with `*, contact:contacts(*, contact_tags(tags(*)))`
+// (see src/lib/inbox/conversations.ts CONVERSATION_SELECT). PostgREST embeds
+// relations in the JSON; Prisma needs an `include`. Table names in the
+// select are mapped to the relation field on the parent model here.
+const RELATION_FIELD_ALIASES: Record<string, string> = {
+  contacts: "contact", // conversations.contact (singular relation)
+  contact_tags: "contactTags",
+  tags: "tag", // contactTags.tag (singular relation)
+  conversations: "conversations",
+  messages: "messages",
+  pipeline_stages: "stage", // deals.stage (singular relation)
+};
+
+interface NestedRelation {
+  /** Relation field on the parent model (Prisma). */
+  field: string;
+  /** PostgREST alias used in the select (defaults to table name). */
+  alias: string;
+  /** Nested relations inside this relation. */
+  children: NestedRelation[];
+}
+
+/** Split `a,b(c(d)),e` on top-level commas (ignores commas inside parens). */
+function splitTopLevel(input: string): string[] {
+  const parts: string[] = [];
+  let depth = 0;
+  let current = "";
+  for (const ch of input) {
+    if (ch === "(") depth++;
+    if (ch === ")") depth--;
+    if (ch === "," && depth === 0) {
+      parts.push(current);
+      current = "";
+    } else {
+      current += ch;
+    }
+  }
+  if (current.trim()) parts.push(current);
+  return parts;
+}
+
+/** Parse a single `alias:table(subselect)` or `table(subselect)` fragment. */
+function parseRelationFragment(fragment: string): NestedRelation | null {
+  const openIdx = fragment.indexOf("(");
+  if (openIdx === -1) return null;
+  const head = fragment.slice(0, openIdx).trim();
+  const rest = fragment.slice(openIdx + 1);
+  // Drop trailing `)` — subselects are a single balanced group in practice.
+  const closeIdx = rest.lastIndexOf(")");
+  const inner = closeIdx !== -1 ? rest.slice(0, closeIdx) : rest;
+
+  const colonIdx = head.indexOf(":");
+  const alias = (colonIdx !== -1 ? head.slice(0, colonIdx) : head).trim();
+  const table = (colonIdx !== -1 ? head.slice(colonIdx + 1) : head).trim();
+  const field = RELATION_FIELD_ALIASES[table] ?? camelToSnake(table);
+  if (!alias || !field) return null;
+
+  const children = parseRelationSelect(inner);
+  return { field, alias, children };
+}
+
+/** Parse `*, contact:contacts(*, contact_tags(tags(*)))` → nested relations. */
+function parseRelationSelect(select: string): NestedRelation[] {
+  const relations: NestedRelation[] = [];
+  for (const part of splitTopLevel(select)) {
+    const rel = parseRelationFragment(part);
+    if (rel) relations.push(rel);
+  }
+  return relations;
+}
+
+/** Build a Prisma include tree from parsed nested relations. */
+function buildInclude(relations: NestedRelation[]): Record<string, unknown> {
+  const include: Record<string, unknown> = {};
+  for (const rel of relations) {
+    const node: Record<string, unknown> = {};
+    if (rel.children.length > 0) {
+      node.include = buildInclude(rel.children);
+    }
+    include[rel.field] = node;
+  }
+  return include;
 }
 
 /** Parse `select=col1,col2` into a Prisma select object. */
@@ -492,9 +615,8 @@ export function parseSelect(
 ): Record<string, true> | undefined {
   if (!selectParam || selectParam === "*") return undefined;
 
-  // If select contains PostgREST nested syntax (parentheses) or
-  // aliased foreign keys (colon syntax), skip select and return all fields.
-  // These require Prisma `include` which is not supported by simple select parsing.
+  // Nested PostgREST syntax (parentheses / aliased foreign keys) maps
+  // to a Prisma include — handled by parseInclude, not select.
   if (selectParam.includes("(") || selectParam.includes(":")) {
     return undefined;
   }
@@ -509,12 +631,98 @@ export function parseSelect(
   return Object.keys(select).length > 0 ? select : undefined;
 }
 
+/** Parse a PostgREST nested select into a Prisma include (or undefined). */
+export function parseInclude(
+  selectParam: string | null,
+): Record<string, unknown> | undefined {
+  if (!selectParam) return undefined;
+  if (!selectParam.includes("(") && !selectParam.includes(":")) {
+    return undefined;
+  }
+  const relations = parseRelationSelect(selectParam);
+  if (relations.length === 0) return undefined;
+  return buildInclude(relations);
+}
+
+// ── Wire shape conversion (Prisma camelCase → PostgREST snake_case) ──
+// The frontend's supabase-style client expects PostgREST JSON: snake_case
+// keys, ISO strings for dates, and embedded relations under their
+// PostgREST alias (`contact_tags` join rows carry `tags`, not `tag`).
+
+/** camelCase → snake_case (`lastMessageAt` → `last_message_at`). */
+export function camelToSnake(s: string): string {
+  return s.replace(/[A-Z]/g, (c) => `_${c.toLowerCase()}`);
+}
+
+/** Convert a Date (or date string) to an ISO string. */
+function toIso(value: unknown): unknown {
+  if (value instanceof Date) return value.toISOString();
+  if (typeof value === "string" && !Number.isNaN(Date.parse(value))) {
+    // PostgREST returns timestamps as ISO strings; keep plain strings.
+    return value;
+  }
+  return value;
+}
+
+/** Recurse a Prisma row into the PostgREST snake_case wire shape. */
+export function toWireShape(value: unknown): unknown {
+  if (Array.isArray(value)) return value.map((v) => toWireShape(v));
+  if (value === null || typeof value !== "object") {
+    return value instanceof Date ? value.toISOString() : value;
+  }
+
+  const obj = value as Record<string, unknown>;
+  const out: Record<string, unknown> = {};
+
+  for (const [key, val] of Object.entries(obj)) {
+    if (val === null || val === undefined) {
+      out[camelToSnake(key)] = val ?? null;
+      continue;
+    }
+    if (val instanceof Date) {
+      out[camelToSnake(key)] = val.toISOString();
+      continue;
+    }
+    // Embedded join rows: contact_tags(tags(*)) comes out of Prisma as
+    // contactTags: [{ tag: {...} }]; PostgREST serializes it as
+    // contact_tags: [{ tags: {...} }] — the frontend flattens `tags`.
+    if (key === "contactTags" && Array.isArray(val)) {
+      out.contact_tags = val.map((row) => {
+        const r = row as Record<string, unknown>;
+        const wireRow: Record<string, unknown> = {};
+        for (const [rk, rv] of Object.entries(r)) {
+          if (rk === "tag") {
+            wireRow.tags = toWireShape(rv);
+          } else if (rk === "tags") {
+            wireRow.tags = toWireShape(rv);
+          } else {
+            wireRow[camelToSnake(rk)] = toWireShape(rv);
+          }
+        }
+        return wireRow;
+      });
+      continue;
+    }
+    if (Array.isArray(val)) {
+      out[camelToSnake(key)] = val.map((v) => toWireShape(v));
+      continue;
+    }
+    if (typeof val === "object") {
+      out[camelToSnake(key)] = toWireShape(val);
+      continue;
+    }
+    out[camelToSnake(key)] = val;
+  }
+  return out;
+}
+
 // ── Query builder ────────────────────────────────────────────────
 
 export interface DataQuery {
   where: Record<string, unknown>;
   orderBy: Record<string, string>[];
   select?: Record<string, true>;
+  include?: Record<string, unknown>;
   take?: number;
   skip?: number;
   countOnly?: boolean;
@@ -528,6 +736,7 @@ export function buildDataQuery(
   const where = parseFilters(table, searchParams);
   const orderBy = parseOrderBy(table, searchParams.get("order"));
   const select = parseSelect(table, searchParams.get("select"));
+  const include = parseInclude(searchParams.get("select"));
 
   const limitStr = searchParams.get("limit");
   const offsetStr = searchParams.get("offset");
@@ -537,15 +746,21 @@ export function buildDataQuery(
   const countOnly = searchParams.get("count") === "exact";
   const headOnly = searchParams.get("head") === "true";
 
-  return { where, orderBy, select, take, skip, countOnly, headOnly };
+  return { where, orderBy, select, include, take, skip, countOnly, headOnly };
 }
 
 // ── Response helpers ─────────────────────────────────────────────
 
-export function ok(data: unknown, count?: number) {
+export function ok(data: unknown, count?: number, contentRangeCount?: number) {
   const body: Record<string, unknown> = { data, error: null };
   if (count !== undefined) body.count = count;
-  return Response.json(body);
+  const res = Response.json(body);
+  // PostgREST exposes the total row count via the Content-Range header;
+  // the client query-builder reads it for `.count('exact')` / head requests.
+  if (contentRangeCount !== undefined) {
+    res.headers.set("content-range", `*/${contentRangeCount}`);
+  }
+  return res;
 }
 
 export function err(message: string, status = 400) {
@@ -558,7 +773,17 @@ function castValue(raw: string): unknown {
   if (raw === "true") return true;
   if (raw === "false") return false;
   if (raw === "null") return null;
+  // Only cast values that fit in int32. Phones, WhatsApp message IDs and
+  // other numeric-looking strings (13-18 digits) must stay strings — casting
+  // them to Number loses precision and breaks Prisma String field filters.
   const n = Number(raw);
-  if (!Number.isNaN(n) && raw !== "") return n;
+  if (
+    !Number.isNaN(n) &&
+    raw !== "" &&
+    Number.isSafeInteger(n) &&
+    Math.abs(n) <= 2147483647
+  ) {
+    return n;
+  }
   return raw;
 }
