@@ -62,12 +62,22 @@ export async function resolveConversationByPhone(
   }
 
   // Fail fast (and create nothing) when the account has no WhatsApp
-  // connected — the same error the send would raise anyway.
-  const config = await prisma.whatsAppConfig.findFirst({
-    where: { accountId },
-    select: { id: true },
-  });
-  if (!config) {
+  // provider connected at all — the same error the send would raise
+  // anyway. Provider-specific config (Meta row vs OpenWA config +
+  // session) is validated by the send core; here we only need to know
+  // that at least one line exists, so an OpenWA-only account is not
+  // blocked by the Meta gate.
+  const [metaConfig, openwaConfig] = await Promise.all([
+    prisma.whatsAppConfig.findFirst({
+      where: { accountId },
+      select: { id: true },
+    }),
+    prisma.openWAConfig.findFirst({
+      where: { accountId },
+      select: { id: true },
+    }),
+  ]);
+  if (!metaConfig && !openwaConfig) {
     throw new SendMessageError(
       'whatsapp_not_configured',
       'WhatsApp not configured. Please set up your WhatsApp integration first.',

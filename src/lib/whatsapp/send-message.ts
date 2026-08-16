@@ -243,8 +243,13 @@ export async function sendMessageToConversation(
     );
   }
 
+  // A stored contact phone may be a full JID (`120363161854316501@lid`) when
+  // the OpenWA gateway couldn't resolve an inbound LID to an MSISDN. Those
+  // digits are NOT an E.164 number — validate only the plain-phone form and
+  // let the OpenWA provider pass the JID through verbatim.
+  const isJid = contact.phone.includes('@');
   const sanitizedPhone = sanitizePhoneForMeta(contact.phone);
-  if (!isValidE164(sanitizedPhone)) {
+  if (!isJid && !isValidE164(sanitizedPhone)) {
     throw new SendMessageError(
       'bad_request',
       'Invalid phone number format',
@@ -252,12 +257,16 @@ export async function sendMessageToConversation(
     );
   }
 
-  // WhatsApp config, account-scoped.
-  const config = await prisma.whatsAppConfig.findUnique({
-    where: { accountId },
-  });
+  // WhatsApp config, account-scoped. Only the Meta line needs these
+  // credentials — an OpenWA conversation resolves its own config +
+  // session via resolveOpenWAProvider below, so an OpenWA-only account
+  // (no Meta row) can still send on the free line.
+  const config =
+    provider === 'openwa'
+      ? null
+      : await prisma.whatsAppConfig.findUnique({ where: { accountId } });
 
-  if (!config) {
+  if (provider !== 'openwa' && !config) {
     throw new SendMessageError(
       'whatsapp_not_configured',
       'WhatsApp not configured. Please set up your WhatsApp integration first.',
@@ -265,14 +274,15 @@ export async function sendMessageToConversation(
     );
   }
 
-  const accessToken = decrypt(config.accessToken);
-
-  // Self-heal legacy CBC ciphertexts. Fire-and-forget; idempotent.
-  if (isLegacyFormat(config.accessToken)) {
+  // Meta-only token handling (config is null by construction on the
+  // OpenWA path). Self-heal legacy CBC ciphertexts — fire-and-forget,
+  // idempotent.
+  const accessToken = config ? decrypt(config.accessToken) : null;
+  if (config && isLegacyFormat(config.accessToken)) {
     void prisma.whatsAppConfig
       .update({
         where: { id: config.id },
-        data: { accessToken: encrypt(accessToken) },
+        data: { accessToken: encrypt(accessToken!) },
       })
       .catch((err: unknown) => {
         console.warn('[send-message] access_token GCM upgrade failed:', err);
@@ -330,10 +340,14 @@ export async function sendMessageToConversation(
   }
 
   const attempt = async (phone: string): Promise<string> => {
+    // Meta line only — this closure is never invoked on the OpenWA
+    // path, where config/accessToken are null by construction.
+    const metaConfig = config!;
+    const token = accessToken!;
     if (messageType === 'template') {
       const result = await sendTemplateMessage({
-        phoneNumberId: config.phoneNumberId,
-        accessToken,
+        phoneNumberId: metaConfig.phoneNumberId,
+        accessToken: token,
         to: phone,
         templateName: templateName!,
         language: templateLanguage || 'en_US',
@@ -346,8 +360,8 @@ export async function sendMessageToConversation(
     }
     if (isMediaKind) {
       const result = await sendMediaMessage({
-        phoneNumberId: config.phoneNumberId,
-        accessToken,
+        phoneNumberId: metaConfig.phoneNumberId,
+        accessToken: token,
         to: phone,
         kind: messageType as MediaKind,
         link: mediaUrl!,
@@ -361,8 +375,8 @@ export async function sendMessageToConversation(
       const p = interactivePayload!;
       if (p.kind === 'buttons') {
         const result = await sendInteractiveButtons({
-          phoneNumberId: config.phoneNumberId,
-          accessToken,
+          phoneNumberId: metaConfig.phoneNumberId,
+          accessToken: token,
           to: phone,
           bodyText: p.body,
           headerText: p.header || undefined,
@@ -373,8 +387,8 @@ export async function sendMessageToConversation(
         return result.messageId;
       }
       const result = await sendInteractiveList({
-        phoneNumberId: config.phoneNumberId,
-        accessToken,
+        phoneNumberId: metaConfig.phoneNumberId,
+        accessToken: token,
         to: phone,
         bodyText: p.body,
         buttonLabel: p.button_label,
@@ -386,8 +400,8 @@ export async function sendMessageToConversation(
       return result.messageId;
     }
     const result = await sendTextMessage({
-      phoneNumberId: config.phoneNumberId,
-      accessToken,
+      phoneNumberId: metaConfig.phoneNumberId,
+      accessToken: token,
       to: phone,
       text: contentText!,
       contextMessageId,
@@ -396,7 +410,8 @@ export async function sendMessageToConversation(
   };
 
   // Send via the conversation's provider. Meta gets the phone-variant
-  // retry; OpenWA sends directly (Baileys keys chats by digit phone).
+  // retry; OpenWA sends directly (Baileys keys chats by digit phone or
+  // verbatim JID).
   let waMessageId = '';
   let workingPhone = sanitizedPhone;
 
@@ -410,8 +425,11 @@ export async function sendMessageToConversation(
     }
     try {
       const openwa = await resolveOpenWAProvider(accountId);
+      // Pass a stored LID JID through verbatim — the gateway accepts
+      // `@lid` directly and resolves `@c.us`→LID for plain numbers.
+      const target = isJid ? contact.phone : sanitizedPhone;
       if (isMediaKind) {
-        const result = await openwa.sendMedia(sanitizedPhone, {
+        const result = await openwa.sendMedia(target, {
           type: messageType as 'image' | 'video' | 'document' | 'audio',
           url: mediaUrl!,
           caption: contentText || undefined,
@@ -419,7 +437,7 @@ export async function sendMessageToConversation(
         });
         waMessageId = result.providerMessageId;
       } else if (messageType === 'text') {
-        const result = await openwa.sendText(sanitizedPhone, contentText!);
+        const result = await openwa.sendText(target, contentText!);
         waMessageId = result.providerMessageId;
       } else {
         throw new SendMessageError(

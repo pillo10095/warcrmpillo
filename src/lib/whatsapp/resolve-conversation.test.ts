@@ -7,6 +7,8 @@ import { beforeEach, describe, expect, it, vi } from 'vitest';
 const mocks = vi.hoisted(() => ({
   prisma: {
     whatsAppConfig: { findFirst: vi.fn(), findUnique: vi.fn() },
+    openWAConfig: { findFirst: vi.fn() },
+    account: { findUnique: vi.fn() },
     contact: { findMany: vi.fn(), update: vi.fn(), create: vi.fn() },
     conversation: { findFirst: vi.fn(), create: vi.fn() },
   },
@@ -31,6 +33,14 @@ beforeEach(() => {
   mocks.prisma.whatsAppConfig.findUnique.mockResolvedValue({
     userId: 'owner-1',
   });
+  // OpenWA line configured by default; the "no config" test overrides
+  // this to null together with the Meta row.
+  mocks.prisma.openWAConfig.findFirst.mockResolvedValue({ id: 'owa-1' });
+  // Account-owner fallback used by resolveAuditUserId when there is no
+  // Meta config (OpenWA-only accounts).
+  mocks.prisma.account.findUnique.mockResolvedValue({
+    ownerUserId: 'owner-1',
+  });
 
   // Defaults: no existing contact, no existing conversation.
   mocks.prisma.contact.findMany.mockResolvedValue([]);
@@ -53,13 +63,43 @@ describe('resolveConversationByPhone', () => {
     expect(mocks.prisma.contact.findMany).not.toHaveBeenCalled();
   });
 
-  it('fails with whatsapp_not_configured when the account has no config', async () => {
+  it('fails with whatsapp_not_configured when the account has no provider config', async () => {
     mocks.prisma.whatsAppConfig.findFirst.mockResolvedValue(null);
+    mocks.prisma.openWAConfig.findFirst.mockResolvedValue(null);
     await expect(
       resolveConversationByPhone(undefined, ACCOUNT_ID, '+14155550123')
     ).rejects.toMatchObject({ code: 'whatsapp_not_configured', status: 400 });
     expect(mocks.prisma.whatsAppConfig.findUnique).not.toHaveBeenCalled();
     expect(mocks.prisma.contact.findMany).not.toHaveBeenCalled();
+  });
+
+  it('resolves when the account has OpenWA config but no Meta config', async () => {
+    // OpenWA-only account: the Meta gate must not block resolution (the
+    // send core validates the OpenWA config + session later).
+    mocks.prisma.whatsAppConfig.findFirst.mockResolvedValue(null);
+    mocks.prisma.whatsAppConfig.findUnique.mockResolvedValue(null);
+    mocks.prisma.openWAConfig.findFirst.mockResolvedValue({ id: 'owa-1' });
+
+    const res = await resolveConversationByPhone(
+      undefined,
+      ACCOUNT_ID,
+      '+14155550123',
+      'Jane'
+    );
+    expect(res).toEqual({
+      conversationId: 'cv2',
+      contactId: 'c2',
+      contactCreated: true,
+    });
+    expect(mocks.prisma.contact.create).toHaveBeenCalledWith({
+      data: {
+        accountId: ACCOUNT_ID,
+        userId: 'owner-1',
+        phone: '14155550123',
+        name: 'Jane',
+      },
+      select: { id: true },
+    });
   });
 
   it('creates the conversation when the contact exists but has none', async () => {

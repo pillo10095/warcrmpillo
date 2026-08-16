@@ -545,6 +545,27 @@ describe('sendMessageToConversation — OpenWA line', () => {
     });
   });
 
+  it('sends via OpenWA even when the account has no Meta config', async () => {
+    // Real-world OpenWA-only setup: no whatsapp_config row at all, but
+    // the OpenWA line is configured. The Meta gate must not run for an
+    // OpenWA conversation (regression: "WhatsApp not configured" on every
+    // inbox send).
+    mocks.prisma.whatsAppConfig.findUnique.mockResolvedValue(null);
+
+    const result = await sendMessageToConversation(undefined, ACCOUNT_ID, {
+      conversationId: 'cv-1',
+      messageType: 'text',
+      contentText: 'Hola gratis',
+    });
+
+    expect(mocks.resolveOpenWAProvider).toHaveBeenCalledWith(ACCOUNT_ID);
+    expect(mocks.openwaProvider.sendText).toHaveBeenCalledWith(
+      '14155550123',
+      'Hola gratis'
+    );
+    expect(result).toEqual({ messageId: 'msg-1', whatsappMessageId: 'owa-msg-1' });
+  });
+
   it('sends media via OpenWA using the flat DTO payload', async () => {
     await sendMessageToConversation(undefined, ACCOUNT_ID, {
       conversationId: 'cv-1',
