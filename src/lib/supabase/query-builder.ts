@@ -73,6 +73,17 @@ function encodeVal(v: unknown): string {
   return String(v);
 }
 
+/**
+ * Resolve an API path to a full URL when running on the server. Node's
+ * `fetch` rejects relative URLs, so internal API calls made during SSR
+ * or from API routes need an absolute URL; the browser accepts the
+ * relative form and must keep it so the request stays same-origin.
+ */
+function resolveApiUrl(path: string): string {
+  if (typeof window !== 'undefined') return path;
+  return `${process.env.APP_URL ?? process.env.NEXT_PUBLIC_APP_URL ?? 'http://localhost:3000'}${path}`;
+}
+
 function buildFilterParams(filters: SupabaseFilterOp[]): string {
   if (filters.length === 0) return '';
   // PostgREST style: ?or=(col.eq.val,and(...))
@@ -277,9 +288,9 @@ export class QueryBuilder<T = any> {
 
     if (isRpc) {
       const fnName = this._table.slice('__rpc:'.length);
-      url = `${baseUrl}/api/data/rpc/${fnName}`;
+      url = resolveApiUrl(`${baseUrl}/api/data/rpc/${fnName}`);
     } else {
-      url = `${baseUrl}/api/data/${encodeURIComponent(this._table)}`;
+      url = resolveApiUrl(`${baseUrl}/api/data/${encodeURIComponent(this._table)}`);
     }
 
     const params = new URLSearchParams();
@@ -488,18 +499,26 @@ export interface SupabaseQueryBuilder {
 }
 
 // eslint-disable-next-line @typescript-eslint/no-explicit-any
-async function fetchAuth(path: string, init?: RequestInit): Promise<any> {
-  const res = await fetch(path, {
+async function fetchAuth(
+  path: string,
+  init?: RequestInit,
+  headers?: Record<string, string>,
+): Promise<any> {
+  const res = await fetch(resolveApiUrl(path), {
     credentials: 'include',
     ...init,
+    headers: { ...(headers ?? {}), ...(init?.headers ?? {}) },
   });
   return res.json().catch(() => ({ error: { message: `HTTP ${res.status}` } }));
 }
 
-function buildAuthStub(): SupabaseQueryBuilder['auth'] {
+function buildAuthStub(config: QueryBuilderConfig = {}): SupabaseQueryBuilder['auth'] {
+  const forward = (path: string, init?: RequestInit) =>
+    fetchAuth(path, init, config.headers);
+
   return {
     async getSession(): Promise<AuthResponse> {
-      const json = await fetchAuth('/api/auth/me');
+      const json = await forward('/api/auth/me');
       if (json.user) {
         return {
           data: {
@@ -513,7 +532,7 @@ function buildAuthStub(): SupabaseQueryBuilder['auth'] {
     },
 
     async getUser(): Promise<AuthResponse> {
-      const json = await fetchAuth('/api/auth/me');
+      const json = await forward('/api/auth/me');
       if (json.user) {
         return {
           data: { user: json.user, session: null },
@@ -524,12 +543,12 @@ function buildAuthStub(): SupabaseQueryBuilder['auth'] {
     },
 
     async signOut() {
-      await fetchAuth('/api/auth/logout', { method: 'POST' });
+      await forward('/api/auth/logout', { method: 'POST' });
       return { error: null };
     },
 
     async signInWithPassword(credentials) {
-      const json = await fetchAuth('/api/auth/login', {
+      const json = await forward('/api/auth/login', {
         method: 'POST',
         headers: { 'Content-Type': 'application/json' },
         body: JSON.stringify(credentials),
@@ -550,7 +569,7 @@ function buildAuthStub(): SupabaseQueryBuilder['auth'] {
       // For now, only password update is supported via settings API
       // Email update would need a dedicated endpoint
       if (data.password) {
-        const json = await fetchAuth('/api/account/password', {
+        const json = await forward('/api/account/password', {
           method: 'PATCH',
           headers: { 'Content-Type': 'application/json' },
           body: JSON.stringify({ password: data.password }),
@@ -560,7 +579,7 @@ function buildAuthStub(): SupabaseQueryBuilder['auth'] {
         }
       }
       // Re-fetch current user
-      const me = await fetchAuth('/api/auth/me');
+      const me = await forward('/api/auth/me');
       return {
         data: { user: me.user ?? null },
         error: me.error ?? null,
@@ -579,6 +598,6 @@ export function createSupabaseQueryBuilder(config: QueryBuilderConfig = {}): Sup
     rpc<T = any>(fn: string, params?: Record<string, unknown>): QueryBuilder<T> {
       return new QueryBuilder<T>('__rpc:' + fn, config).rpc(fn, params);
     },
-    auth: buildAuthStub(),
+    auth: buildAuthStub(config),
   };
 }
