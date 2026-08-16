@@ -58,9 +58,12 @@ export default function NotificationsPage() {
           `/api/data/notifications?select=*&account_id=eq.${accountId}&order=created_at.desc&limit=100`
         );
         if (!res.ok || cancelled) return;
-        const rows = (await res.json()) as Notification[];
+        const json = (await res.json()) as { data?: Notification[] } | Notification[];
+        const rows = Array.isArray(json)
+          ? json
+          : ((json as { data?: Notification[] }).data ?? []);
         if (cancelled) return;
-        setNotifications(rows);
+        setNotifications(rows as Notification[]);
       } catch {
         // Network error — skip this tick.
       }

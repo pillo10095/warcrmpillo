@@ -58,7 +58,10 @@ export function useRealtime({
             "/api/data/messages?select=*&order=created_at.desc&limit=50"
           );
           if (msgRes.ok && !cancelled) {
-            const msgs = (await msgRes.json()) as Message[];
+            const json = (await msgRes.json()) as { data?: Message[] } | Message[];
+            const msgs = Array.isArray(json)
+              ? json
+              : ((json as { data?: Message[] }).data ?? []);
             const prev = prevMessagesRef.current;
 
             for (const msg of msgs) {
@@ -108,7 +111,10 @@ export function useRealtime({
             "/api/data/conversations?select=*&order=last_message_at.desc&limit=50"
           );
           if (convRes.ok && !cancelled) {
-            const convs = (await convRes.json()) as Conversation[];
+            const json = (await convRes.json()) as { data?: Conversation[] } | Conversation[];
+            const convs = Array.isArray(json)
+              ? json
+              : ((json as { data?: Conversation[] }).data ?? []);
             const prev = prevConversationsRef.current;
 
             for (const conv of convs) {
@@ -162,7 +168,10 @@ export function useRealtime({
             "/api/data/messages?select=*&order=created_at.desc&limit=50"
           );
           if (msgRes.ok && !cancelled) {
-            const msgs = (await msgRes.json()) as Message[];
+            const json = (await msgRes.json()) as { data?: Message[] } | Message[];
+            const msgs = Array.isArray(json)
+              ? json
+              : ((json as { data?: Message[] }).data ?? []);
             const map = new Map<string, Message>();
             for (const m of msgs) map.set(m.id, m);
             prevMessagesRef.current = map;
@@ -173,7 +182,10 @@ export function useRealtime({
             "/api/data/conversations?select=*&order=last_message_at.desc&limit=50"
           );
           if (convRes.ok && !cancelled) {
-            const convs = (await convRes.json()) as Conversation[];
+            const json = (await convRes.json()) as { data?: Conversation[] } | Conversation[];
+            const convs = Array.isArray(json)
+              ? json
+              : ((json as { data?: Conversation[] }).data ?? []);
             const map = new Map<string, Conversation>();
             for (const c of convs) map.set(c.id, c);
             prevConversationsRef.current = map;

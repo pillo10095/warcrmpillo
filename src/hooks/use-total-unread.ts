@@ -25,7 +25,12 @@ export function useTotalUnread(): number {
           "/api/data/conversations?select=id,unread_count"
         );
         if (!res.ok || cancelled) return;
-        const rows = (await res.json()) as { id: string; unread_count: number }[];
+        const json = (await res.json()) as
+          | { data?: { id: string; unread_count: number }[] }
+          | { id: string; unread_count: number }[];
+        const rows = Array.isArray(json)
+          ? json
+          : ((json as { data?: { id: string; unread_count: number }[] }).data ?? []);
         if (cancelled) return;
 
         let sum = 0;

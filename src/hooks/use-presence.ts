@@ -58,11 +58,13 @@ export function usePresence(enabled = true): UsePresenceResult {
           `/api/data/member_presence?select=user_id,status,last_seen_at&account_id=eq.${accountId}`
         );
         if (!res.ok || cancelled) return;
-        const data = (await res.json()) as {
-          user_id: string;
-          status: StoredPresence;
-          last_seen_at: string;
-        }[];
+        const json = (await res.json()) as
+          | { data?: { user_id: string; status: StoredPresence; last_seen_at: string }[] }
+          | { user_id: string; status: StoredPresence; last_seen_at: string }[];
+        const data = Array.isArray(json)
+          ? json
+          : ((json as { data?: { user_id: string; status: StoredPresence; last_seen_at: string }[] })
+              .data ?? []);
         if (cancelled) return;
 
         setRows((prev) => {

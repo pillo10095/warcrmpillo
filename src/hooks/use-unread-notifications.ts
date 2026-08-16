@@ -24,7 +24,10 @@ export function useUnreadNotifications(): number {
           "/api/data/notifications?select=*&read_at=is.null"
         );
         if (!res.ok || cancelled) return;
-        const rows = (await res.json()) as Notification[];
+        const json = (await res.json()) as { data?: Notification[] } | Notification[];
+        const rows = Array.isArray(json)
+          ? json
+          : ((json as { data?: Notification[] }).data ?? []);
         if (cancelled) return;
         setCount(rows.length);
       } catch {
