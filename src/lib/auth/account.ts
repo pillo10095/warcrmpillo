@@ -30,6 +30,7 @@ import type { SupabaseQueryBuilder } from "@/lib/supabase/query-builder";
 
 import { createClient } from "@/lib/supabase/server";
 import { hasMinRole, isAccountRole, type AccountRole } from "./roles";
+import { prisma } from "@/lib/db/prisma";
 
 // ------------------------------------------------------------
 // Errors
@@ -114,49 +115,31 @@ export async function getCurrentAccount(): Promise<AccountContext> {
     throw new UnauthorizedError();
   }
 
-  const { data, error } = await supabase
-    .from("profiles")
-    .select("account_id, account_role")
-    .eq("user_id", user.id)
-    .maybeSingle();
-
-  if (error) {
-    console.error("[getCurrentAccount] profile fetch error:", error);
-    throw new ForbiddenError("Could not load account context");
-  }
-  if (!data || !data.account_id || !data.account_role) {
+  // Resolve account + role from the Prisma schema. The old Supabase
+  // `profiles.account_id / account_role` columns no longer exist in the
+  // MySQL migration — membership now lives in `account_members`.
+  const member = await prisma.accountMember.findUnique({
+    where: { userId: user.id },
+  });
+  if (!member) {
     // Pre-migration profile, or a manual insert that skipped the
     // signup trigger. The user is authenticated but the app has
     // no way to scope their queries — treat as forbidden.
     throw new ForbiddenError("Profile is not linked to an account");
   }
-  if (!isAccountRole(data.account_role)) {
+  if (!isAccountRole(member.role)) {
     // The DB enum should make this impossible, but a future
     // migration that broadens the enum without updating TS would
     // hit this — surface it rather than silently widening.
-    throw new ForbiddenError(`Unknown account role: ${data.account_role}`);
+    throw new ForbiddenError(`Unknown account role: ${member.role}`);
   }
 
-  // Load the account with a plain point lookup by id rather than an
-  // embedded FK join (`account:accounts!inner(...)`). The embed forces
-  // PostgREST to resolve the profiles.account_id → accounts.id
-  // relationship from its schema cache; when that cache is stale — a
-  // common Supabase state right after a migration adds the FK, or when
-  // migrations are applied out of band — the embed fails hard with
-  // PGRST200 ("could not find a relationship … in the schema cache")
-  // and takes down the entire account context (issue #294). A lookup by
-  // id needs no relationship inference and is gated by the same accounts
-  // RLS, so it stays robust against cache staleness and older schemas.
-  const { data: account, error: accountErr } = await supabase
-    .from("accounts")
-    .select("id, name")
-    .eq("id", data.account_id)
-    .maybeSingle();
-
-  if (accountErr) {
-    console.error("[getCurrentAccount] account fetch error:", accountErr);
-    throw new ForbiddenError("Could not load account context");
-  }
+  // Load the account with a plain point lookup by id. Nothing tricky —
+  // accounts is unscoped and the caller already proved membership.
+  const account = await prisma.account.findUnique({
+    where: { id: member.accountId },
+    select: { id: true, name: true },
+  });
   if (!account) {
     // account_id points at no readable account row — orphaned profile
     // or an RLS gap. Same "can't scope this user" outcome as above.
@@ -166,8 +149,8 @@ export async function getCurrentAccount(): Promise<AccountContext> {
   return {
     supabase,
     userId: user.id,
-    accountId: data.account_id,
-    role: data.account_role,
+    accountId: member.accountId,
+    role: member.role,
     account: { id: account.id, name: account.name },
   };
 }

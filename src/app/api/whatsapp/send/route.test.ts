@@ -156,6 +156,17 @@ const { sendTemplateMessage, prisma } = vi.hoisted(() => ({
   // conversation id so the message/conversation writes can be asserted
   // against the right thread.
   prisma: {
+    accountMember: {
+      findUnique: vi.fn(async () => ({
+        id: 'member-1',
+        userId: 'user-1',
+        accountId: 'acct-1',
+        role: callerRole,
+      })),
+    },
+    account: {
+      findUnique: vi.fn(async () => ({ id: 'acct-1', name: 'Acme' })),
+    },
     conversation: {
       findFirst: vi.fn((args: { where?: { id?: string } }) =>
         Promise.resolve({
