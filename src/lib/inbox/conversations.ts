@@ -62,6 +62,7 @@ export function prismaToConversation(row: ConversationRow): Conversation {
     id: row.id,
     user_id: row.userId,
     contact_id: row.contactId,
+    provider: row.provider ?? "meta",
     status: row.status,
     assigned_agent_id: row.assignedAgentId ?? undefined,
     last_message_text: row.lastMessageText ?? undefined,

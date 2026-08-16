@@ -188,13 +188,10 @@ function InboxPageInner() {
       // for any teammate who didn't personally save the config —
       // the "WhatsApp not connected" banner would show in the
       // shared inbox even though the admin had it configured.
-      // Resolve account_id via the profile and query by that.
-      const { data: profile } = await supabase
-        .from("profiles")
-        .select("account_id")
-        .eq("user_id", user.id)
-        .maybeSingle();
-      const accountId = profile?.account_id as string | undefined;
+      // Resolve account_id via /api/auth/me and query by that.
+      const meRes = await fetch("/api/auth/me", { credentials: "include" });
+      const me = meRes.ok ? await meRes.json() : null;
+      const accountId = me?.account?.id as string | undefined;
       if (!accountId) {
         setWhatsappConnected(false);
         return;
@@ -206,7 +203,25 @@ function InboxPageInner() {
         .eq("account_id", accountId)
         .maybeSingle();
 
-      setWhatsappConnected(data?.status === "connected");
+      // The account may use OpenWA instead of (or in addition to) the
+      // legacy Meta/WhatsApp Cloud API config. The data proxy scopes
+      // openwa_sessions to this account via its config relation, so a
+      // plain list is enough — a ready session counts as connected.
+      let openwaConnected = false;
+      try {
+        const { data: openwaSessions } = await supabase
+          .from("openwa_sessions")
+          .select("status");
+        openwaConnected =
+          Array.isArray(openwaSessions) &&
+          openwaSessions.some((s: { status: string }) => s.status === "ready");
+      } catch {
+        // openwa_sessions may not exist yet on older deployments — ignore.
+      }
+
+      setWhatsappConnected(
+        data?.status === "connected" || openwaConnected,
+      );
     };
 
     checkConnection();

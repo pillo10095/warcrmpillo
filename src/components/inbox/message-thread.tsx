@@ -237,9 +237,14 @@ export function MessageThread({
     };
   }, []);
 
-  // 24-hour session timer
+  // 24-hour session timer — Meta Cloud API only. OpenWA (self-hosted
+  // gateway) has no customer-service window, so the composer stays
+  // enabled regardless of how old the last customer message is.
   const sessionInfo = useMemo(() => {
     if (!messages.length) return { expired: false, remaining: "" };
+    if (conversation?.provider === "openwa") {
+      return { expired: false, remaining: "" };
+    }
 
     // Find last customer message
     const lastCustomerMsg = [...messages]
@@ -374,7 +379,12 @@ export function MessageThread({
           `/api/data/message_reactions?select=*&conversation_id=eq.${conversationId}`
         );
         if (!res.ok || cancelled) return;
-        const data = (await res.json()) as MessageReaction[];
+        const json = (await res.json()) as
+          | { data?: MessageReaction[] }
+          | MessageReaction[];
+        const data = Array.isArray(json)
+          ? json
+          : ((json as { data?: MessageReaction[] }).data ?? []);
         if (cancelled) return;
 
         setReactions((prev) => {

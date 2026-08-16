@@ -161,6 +161,12 @@ export interface Conversation {
   id: string;
   user_id: string;
   contact_id: string;
+  /**
+   * WhatsApp provider backing this thread: `meta` (WhatsApp Cloud API,
+   * enforces the 24h customer-service window) or `openwa` (self-hosted
+   * gateway, no 24h window — agents can message anytime).
+   */
+  provider?: string;
   status: ConversationStatus;
   assigned_agent_id?: string;
   last_message_text?: string;
