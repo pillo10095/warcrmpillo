@@ -42,22 +42,39 @@ export async function POST(_request: Request, ctx: RouteContext) {
     } catch (err) {
       const message =
         err instanceof Error ? err.message : 'Unknown OpenWA error';
+
+      // OpenWA auto-starts sessions on create (or a prior start already
+      // brought the engine up). "already started" is not an error — the
+      // session is live, so reflect its real status and continue.
+      if (/already started/i.test(message)) {
+        started = await client.getSession(session.openwaSessionId);
+        return finishStarted(prisma, session.id, started.status);
+      }
+
       return NextResponse.json(
         { error: `OpenWA start failed: ${message}` },
         { status: 502 }
       );
     }
 
-    await prisma.openWASession.update({
-      where: { id: session.id },
-      data: { status: started.status, updatedAt: new Date() },
-    });
-
-    return NextResponse.json({
-      success: true,
-      status: started.status,
-    });
+    return finishStarted(prisma, session.id, started.status);
   } catch (err) {
     return toErrorResponse(err);
   }
+}
+
+async function finishStarted(
+  prisma: typeof import('@/lib/db/prisma').prisma,
+  sessionId: string,
+  status: string,
+) {
+  await prisma.openWASession.update({
+    where: { id: sessionId },
+    data: { status, updatedAt: new Date() },
+  });
+
+  return NextResponse.json({
+    success: true,
+    status,
+  });
 }

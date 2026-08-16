@@ -43,11 +43,38 @@ export async function GET(_request: Request, ctx: RouteContext) {
     } catch (err) {
       const message =
         err instanceof Error ? err.message : 'Unknown OpenWA error';
-      return NextResponse.json(
-        { error: `OpenWA QR fetch failed: ${message}` },
-        { status: 502 }
-      );
+
+      // A freshly created session is not started yet — OpenWA requires
+      // POST /sessions/:id/start before a QR exists. Auto-start once,
+      // then fetch the QR so the UI "QR" button just works.
+      if (/not started/i.test(message)) {
+        try {
+          await client.startSession(session.openwaSessionId);
+        } catch (startErr) {
+          // "already started" is fine; anything else bubbles up.
+          const startMessage =
+            startErr instanceof Error ? startErr.message : 'Unknown OpenWA error';
+          if (!/already started/i.test(startMessage)) {
+            return NextResponse.json(
+              { error: `OpenWA start failed: ${startMessage}` },
+              { status: 502 }
+            );
+          }
+        }
+        qr = await client.getQr(session.openwaSessionId);
+      } else {
+        return NextResponse.json(
+          { error: `OpenWA QR fetch failed: ${message}` },
+          { status: 502 }
+        );
+      }
     }
+
+    // Persist the live status (covers the auto-start path above).
+    await prisma.openWASession.update({
+      where: { id: session.id },
+      data: { status: qr.status, updatedAt: new Date() },
+    });
 
     return NextResponse.json({
       qr_code: qr.qrCode,
