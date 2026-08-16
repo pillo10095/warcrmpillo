@@ -47,3 +47,6 @@ next-env.d.ts
 
 # uploads (local disk storage)
 /uploads
+
+# playwright-cli debug captures
+.playwright-cli/
